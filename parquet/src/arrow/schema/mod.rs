@@ -42,7 +42,7 @@ mod complex;
 mod primitive;
 
 use crate::arrow::ProjectionMask;
-pub(crate) use complex::{ParquetField, ParquetFieldType};
+pub use complex::{ParquetField, ParquetFieldType};
 
 use super::PARQUET_FIELD_ID_META_KEY;
 
