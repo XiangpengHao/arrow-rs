@@ -370,7 +370,7 @@ impl RowGroupMetaData {
     }
 
     /// Method to convert from Thrift.
-    pub fn from_thrift(schema_descr: SchemaDescPtr, mut rg: RowGroup) -> Result<RowGroupMetaData> {
+    pub fn from_thrift(schema_descr: SchemaDescPtr, rg: RowGroup) -> Result<RowGroupMetaData> {
         if schema_descr.num_columns() != rg.columns.len() {
             return Err(general_err!(
                 "Column count mismatch. Schema has {} columns while Row Group has {}",
@@ -380,8 +380,8 @@ impl RowGroupMetaData {
         }
         let total_byte_size = rg.total_byte_size;
         let num_rows = rg.num_rows;
-        let mut columns = vec![];
-        for (c, d) in rg.columns.drain(0..).zip(schema_descr.columns()) {
+        let mut columns = Vec::with_capacity(rg.columns.len());
+        for (c, d) in rg.columns.into_iter().zip(schema_descr.columns()) {
             let cc = ColumnChunkMetaData::from_thrift(d.clone(), c)?;
             columns.push(cc);
         }
@@ -494,10 +494,10 @@ pub struct ColumnChunkMetaData {
     total_compressed_size: i64,
     total_uncompressed_size: i64,
     data_page_offset: i64,
+    statistics: Option<Box<Statistics>>,
+    encoding_stats: Option<Vec<PageEncodingStats>>,
     index_page_offset: Option<i64>,
     dictionary_page_offset: Option<i64>,
-    statistics: Option<Statistics>,
-    encoding_stats: Option<Vec<PageEncodingStats>>,
     bloom_filter_offset: Option<i64>,
     bloom_filter_length: Option<i32>,
     offset_index_offset: Option<i64>,
@@ -603,7 +603,7 @@ impl ColumnChunkMetaData {
     /// Returns statistics that are set for this column chunk,
     /// or `None` if no statistics are available.
     pub fn statistics(&self) -> Option<&Statistics> {
-        self.statistics.as_ref()
+        self.statistics.as_ref().map(|s| s.as_ref())
     }
 
     /// Returns the offset for the page encoding stats,
@@ -737,26 +737,25 @@ impl ColumnChunkMetaData {
 
     /// Method to convert to Thrift `ColumnMetaData`
     pub fn to_column_metadata_thrift(&self) -> ColumnMetaData {
-        ColumnMetaData {
-            type_: self.column_type().into(),
-            encodings: self.encodings().iter().map(|&v| v.into()).collect(),
-            path_in_schema: self.column_path().as_ref().to_vec(),
-            codec: self.compression.into(),
-            num_values: self.num_values,
-            total_uncompressed_size: self.total_uncompressed_size,
-            total_compressed_size: self.total_compressed_size,
-            key_value_metadata: None,
-            data_page_offset: self.data_page_offset,
-            index_page_offset: self.index_page_offset,
-            dictionary_page_offset: self.dictionary_page_offset,
-            statistics: statistics::to_thrift(self.statistics.as_ref()),
-            encoding_stats: self
-                .encoding_stats
+        ColumnMetaData::new(
+            self.column_type().into(),
+            self.encodings().iter().map(|&v| v.into()).collect(),
+            self.column_path().as_ref().to_vec(),
+            self.compression.into(),
+            self.num_values,
+            self.total_uncompressed_size,
+            self.total_compressed_size,
+            None,
+            self.data_page_offset(),
+            self.index_page_offset(),
+            self.dictionary_page_offset(),
+            statistics::to_thrift(self.statistics.as_ref().map(|s| s.as_ref())),
+            self.encoding_stats
                 .as_ref()
                 .map(|vec| vec.iter().map(page_encoding_stats::to_thrift).collect()),
-            bloom_filter_offset: self.bloom_filter_offset,
-            bloom_filter_length: self.bloom_filter_length,
-        }
+            self.bloom_filter_offset(),
+            self.bloom_filter_length(),
+        )
     }
 
     /// Converts this [`ColumnChunkMetaData`] into a [`ColumnChunkMetaDataBuilder`]
@@ -856,7 +855,7 @@ impl ColumnChunkMetaDataBuilder {
 
     /// Sets statistics for this column chunk.
     pub fn set_statistics(mut self, value: Statistics) -> Self {
-        self.0.statistics = Some(value);
+        self.0.statistics = Some(Box::new(value));
         self
     }
 

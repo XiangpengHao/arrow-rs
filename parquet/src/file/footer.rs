@@ -18,7 +18,7 @@
 use std::{io::Read, sync::Arc};
 
 use crate::format::{ColumnOrder as TColumnOrder, FileMetaData as TFileMetaData};
-use crate::thrift::{TCompactSliceInputProtocol, TSerializable};
+use crate::thrift::{TCompactSimdInputProtocol, TCompactSliceInputProtocol, TSerializable};
 
 use crate::basic::ColumnOrder;
 
@@ -90,12 +90,14 @@ pub fn parse_metadata<R: ChunkReader>(chunk_reader: &R) -> Result<ParquetMetaDat
 /// [Parquet Spec]: https://github.com/apache/parquet-format#metadata
 pub fn decode_metadata(buf: &[u8]) -> Result<ParquetMetaData> {
     // TODO: row group filtering
-    let mut prot = TCompactSliceInputProtocol::new(buf);
+    // let mut prot = TCompactSliceInputProtocol::new(buf);
+    let mut prot = TCompactSimdInputProtocol::new(buf);
     let t_file_metadata: TFileMetaData = TFileMetaData::read_from_in_protocol(&mut prot)
         .map_err(|e| ParquetError::General(format!("Could not parse metadata: {e}")))?;
+
     let schema = types::from_thrift(&t_file_metadata.schema)?;
     let schema_descr = Arc::new(SchemaDescriptor::new(schema));
-    let mut row_groups = Vec::new();
+    let mut row_groups = Vec::with_capacity(t_file_metadata.row_groups.len());
     for rg in t_file_metadata.row_groups {
         row_groups.push(RowGroupMetaData::from_thrift(schema_descr.clone(), rg)?);
     }
