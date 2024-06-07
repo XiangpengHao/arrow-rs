@@ -108,6 +108,30 @@ impl<'a> TCompactSliceInputProtocol<'a> {
         self.read_bytes_skip();
     }
 
+    pub fn decode_vlq_i32_skip(&mut self) {
+        let b = unsafe { self.buf.as_ptr().cast::<u64>().read_unaligned() };
+        let msbs = !b & !0x7f7f7f7f7f7f7f7f;
+        let len = msbs.trailing_zeros() + 1; // in bits
+        let len = (len / 8) as usize;
+        self.buf = &self.buf[len..];
+    }
+
+    pub fn decode_vlq_i64_skip(&mut self) {
+        let bytes = self.buf.as_ptr();
+        let b0 = unsafe { bytes.cast::<u64>().read_unaligned() };
+        let b1 = unsafe { bytes.cast::<u64>().add(1).read_unaligned() };
+
+        let msbs0 = !b0 & !0x7f7f7f7f7f7f7f7f;
+        let msbs1 = !b1 & !0x7f7f7f7f7f7f7f7f;
+
+        let len0 = msbs0.trailing_zeros() + 1;
+        let len1 = msbs1.trailing_zeros() + 1;
+
+        let len = (if msbs0 == 0 { len1 + 64 } else { len0 } / 8) as usize;
+
+        self.buf = &self.buf[len..];
+    }
+
     pub fn read_vlq_skip(&mut self) {
         loop {
             let byte = self.read_byte().unwrap();
@@ -126,7 +150,7 @@ impl<'a> TCompactSliceInputProtocol<'a> {
     }
 
     pub fn read_i32_skip(&mut self) {
-        self.read_zig_zag_skip();
+        self.decode_vlq_i32_skip();
     }
 }
 

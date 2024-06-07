@@ -18,10 +18,10 @@
 use arrow::util::test_util::seedable_rng;
 use criterion::*;
 use parquet::format::{
-    ColumnChunk, ColumnMetaData, CompressionCodec, Encoding, FieldRepetitionType, FileMetaData,
-    RowGroup, SchemaElement, Type,
+    ColumnChunk, ColumnMetaData, CompressionCodec, Encoding, FieldRepetitionType, RowGroup,
+    SchemaElement, Type,
 };
-use parquet::thrift::{TCompactSliceInputProtocol, TSerializable};
+use parquet::thrift::{TCompactSimdInputProtocol, TCompactSliceInputProtocol, TSerializable};
 use rand::Rng;
 use thrift::protocol::TCompactOutputProtocol;
 
@@ -126,7 +126,6 @@ fn criterion_benchmark(c: &mut Criterion) {
     let buf = black_box(encoded_meta());
     println!("Parquet metadata {}", buf.len());
 
-    
     c.bench_function("decode full pass", |b| {
         b.iter(|| {
             let mut input = TCompactSliceInputProtocol::new(&buf);
