@@ -16,12 +16,7 @@
 // under the License.
 
 use arrow::util::test_util::seedable_rng;
-use arrow_ipc::writer::{IpcDataGenerator, IpcWriteOptions};
-use arrow_schema::{DataType, Field, Fields, Schema};
-use bytes::Bytes;
 use criterion::*;
-use parquet::file::reader::SerializedFileReader;
-use parquet::file::serialized_reader::ReadOptionsBuilder;
 use parquet::format::{
     ColumnChunk, ColumnMetaData, CompressionCodec, Encoding, FieldRepetitionType, FileMetaData,
     RowGroup, SchemaElement, Type,
@@ -107,7 +102,7 @@ fn encoded_meta() -> Vec<u8> {
             }
         })
         .collect();
-    let file = FileMetaData {
+    let file = parquet::format::FileMetaData {
         schema,
         row_groups,
         version: 1,
@@ -127,48 +122,22 @@ fn encoded_meta() -> Vec<u8> {
     buf
 }
 
-fn encoded_ipc_schema() -> Vec<u8> {
-    let schema = Schema::new(Fields::from_iter(
-        (0..NUM_COLUMNS).map(|i| Field::new(i.to_string(), DataType::Float64, true)),
-    ));
-
-    let data = IpcDataGenerator::default();
-    let r = data.schema_to_bytes(&schema, &IpcWriteOptions::default());
-    assert_eq!(r.arrow_data.len(), 0);
-    r.ipc_message
-}
-
 fn criterion_benchmark(c: &mut Criterion) {
     let buf = black_box(encoded_meta());
     println!("Parquet metadata {}", buf.len());
 
-    c.bench_function("decode metadata", |b| {
+    
+    c.bench_function("decode full pass", |b| {
         b.iter(|| {
             let mut input = TCompactSliceInputProtocol::new(&buf);
-            FileMetaData::read_from_in_protocol(&mut input).unwrap();
+            parquet::format::FileMetaData::read_from_in_protocol(&mut input).unwrap();
         })
     });
 
-    let buf = black_box(encoded_ipc_schema());
-    println!("Arrow IPC schema {}", buf.len());
-
-    c.bench_function("decode ipc metadata", |b| {
-        b.iter(|| arrow_ipc::root_as_message(&buf).unwrap())
-    });
-
-    // Read file into memory to isolate filesystem performance
-    let file = "../parquet-testing/data/alltypes_tiny_pages.parquet";
-    let data = std::fs::read(file).unwrap();
-    let data = Bytes::from(data);
-
-    c.bench_function("open(default)", |b| {
-        b.iter(|| SerializedFileReader::new(data.clone()).unwrap())
-    });
-
-    c.bench_function("open(page index)", |b| {
+    c.bench_function("decode cursor", |b| {
         b.iter(|| {
-            let options = ReadOptionsBuilder::new().with_page_index().build();
-            SerializedFileReader::new_with_options(data.clone(), options).unwrap()
+            let mut input = TCompactSliceInputProtocol::new(&buf);
+            parquet::format2::FileMetaData::read_from_in_protocol(&mut input).unwrap();
         })
     });
 }

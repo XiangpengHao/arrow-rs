@@ -60,7 +60,7 @@ chrono = { workspace = true }
 num = { version = "0.4", default-features = false }
 num-bigint = { version = "0.4", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["std", ], optional = true }
-clap = { version = "4.1", default-features = false, features = ["std", "derive", "env", "help", "error-context", "usage"], optional = true }
+clap = { version = "4.1", default-features = false, features = ["std", "derive", "env", "help", "error-context", "usage"] }
 serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
 serde_json = { version = "1.0", default-features = false, features = ["std"], optional = true }
 seq-macro = { version = "0.3", default-features = false }
@@ -100,7 +100,7 @@ lz4 = ["lz4_flex"]
 # Enable arrow reader/writer APIs
 arrow = ["base64", "arrow-array", "arrow-buffer", "arrow-cast", "arrow-data", "arrow-schema", "arrow-select", "arrow-ipc"]
 # Enable CLI tools
-cli = ["json", "base64", "clap", "arrow-csv", "serde"]
+cli = ["json", "base64", "arrow-csv", "serde"]
 # Enable JSON APIs
 json = ["serde_json", "base64"]
 # Enable internal testing APIs

@@ -35,6 +35,7 @@ pub trait TSerializable: Sized {
 ///
 /// [`TCompactInputProtocol`]: thrift::protocol::TCompactInputProtocol
 pub struct TCompactSliceInputProtocol<'a> {
+    start_ptr: *const u8,
     buf: &'a [u8],
     // Identifier of the last field deserialized for a struct.
     last_read_field_id: i16,
@@ -49,11 +50,16 @@ pub struct TCompactSliceInputProtocol<'a> {
 impl<'a> TCompactSliceInputProtocol<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
         Self {
+            start_ptr: buf.as_ptr(),
             buf,
             last_read_field_id: 0,
             read_field_id_stack: Vec::with_capacity(16),
             pending_read_bool_value: None,
         }
+    }
+
+    pub fn buffer_offset(&self) -> usize {
+        self.buf.as_ptr() as usize - self.start_ptr as usize
     }
 
     pub fn as_slice(&self) -> &'a [u8] {
@@ -91,6 +97,36 @@ impl<'a> TCompactSliceInputProtocol<'a> {
         };
 
         Ok((element_type, element_count))
+    }
+
+    pub fn read_bytes_skip(&mut self) {
+        let len = self.read_vlq().unwrap() as usize;
+        self.buf = &self.buf[len..];
+    }
+
+    pub fn read_string_skip(&mut self) {
+        self.read_bytes_skip();
+    }
+
+    pub fn read_vlq_skip(&mut self) {
+        loop {
+            let byte = self.read_byte().unwrap();
+            if byte & 0x80 == 0 {
+                return;
+            }
+        }
+    }
+
+    pub fn read_zig_zag_skip(&mut self) {
+        self.read_vlq_skip();
+    }
+
+    pub fn read_i64_skip(&mut self) {
+        self.read_zig_zag_skip();
+    }
+
+    pub fn read_i32_skip(&mut self) {
+        self.read_zig_zag_skip();
     }
 }
 

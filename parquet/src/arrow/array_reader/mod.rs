@@ -46,7 +46,6 @@ mod test_util;
 
 pub use builder::build_array_reader;
 pub use byte_array::make_byte_array_reader;
-pub use byte_array::make_byte_view_array_reader;
 pub use byte_array_dictionary::make_byte_array_dictionary_reader;
 #[allow(unused_imports)] // Only used for benchmarks
 pub use fixed_len_byte_array::make_fixed_len_byte_array_reader;
@@ -59,12 +58,14 @@ pub use struct_array::StructArrayReader;
 
 /// Array reader reads parquet data into arrow array.
 pub trait ArrayReader: Send {
+    #[allow(dead_code)]
     fn as_any(&self) -> &dyn Any;
 
     /// Returns the arrow type of this array reader.
     fn get_data_type(&self) -> &ArrowType;
 
     /// Reads at most `batch_size` records into an arrow array and return it.
+    #[allow(dead_code)]
     fn next_batch(&mut self, batch_size: usize) -> Result<ArrayRef> {
         self.read_records(batch_size)?;
         self.consume_batch()

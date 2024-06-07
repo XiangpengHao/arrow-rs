@@ -116,6 +116,9 @@ pub mod basic;
 #[rustfmt::skip]
 pub mod format;
 
+pub mod format2;
+pub mod format_index;
+
 #[macro_use]
 pub mod data_type;
 
