@@ -344,6 +344,7 @@ fn make_view_inner<const LEN: usize>(data: &[u8]) -> u128 {
 pub fn make_view(data: &[u8], block_id: u32, offset: u32) -> u128 {
     let len = data.len() as u32;
     match len {
+        0 => make_view_inner::<0>(data),
         1 => make_view_inner::<1>(data),
         2 => make_view_inner::<2>(data),
         3 => make_view_inner::<3>(data),
