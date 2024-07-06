@@ -316,7 +316,8 @@ impl ByteViewArrayDecoderPlain {
     }
 
     pub fn read(&mut self, output: &mut ViewBuffer, len: usize) -> Result<usize> {
-        let block_id = output.append_block(self.buf.clone().into());
+        let buf = arrow_buffer::Buffer::from_bytes(self.buf.clone().into());
+        let block_id = output.append_block(buf);
 
         let to_read = len.min(self.max_remaining_values);
 
