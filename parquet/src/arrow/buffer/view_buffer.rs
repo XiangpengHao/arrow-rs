@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::arrow::record_reader::buffer::ValuesBuffer;
-use arrow_array::{builder::make_view, make_array, ArrayRef};
+use arrow_array::{make_array, ArrayRef};
 use arrow_buffer::Buffer;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType as ArrowType;
@@ -49,11 +49,35 @@ impl ViewBuffer {
     /// - `offset` and `offset + len` are valid indices into the buffer
     /// - The `(offset, offset + len)` is valid value for the native type.
     pub unsafe fn append_view_unchecked(&mut self, block: u32, offset: u32, len: u32) {
-        let b = self.buffers.get_unchecked(block as usize);
+        let buffer = self.buffers.get_unchecked(block as usize);
         let end = offset.saturating_add(len);
-        let b = b.get_unchecked(offset as usize..end as usize);
+        let data = buffer.get_unchecked(offset as usize..end as usize);
 
-        let view = make_view(b, block, offset);
+        let view = {
+            if len <= 12 {
+                if buffer.len() >= (offset as usize + 16) {
+                    let unused_bytes = 16 - len;
+                    let mut view: u128 =
+                        unsafe { (data.as_ptr() as *const u128).read() } >> (4 + unused_bytes);
+                    view = view << unused_bytes;
+                    view |= (len as u128) << 124;
+                    view
+                } else {
+                    let mut view_buffer = [0; 16];
+                    view_buffer[0..4].copy_from_slice(&len.to_le_bytes());
+                    view_buffer[4..4 + data.len()].copy_from_slice(data);
+                    u128::from_le_bytes(view_buffer)
+                }
+            } else {
+                let view = arrow_data::ByteView {
+                    length: len,
+                    prefix: u32::from_le_bytes(data[0..4].try_into().unwrap()),
+                    buffer_index: block,
+                    offset,
+                };
+                view.into()
+            }
+        };
 
         self.views.push(view);
     }
