@@ -20,8 +20,9 @@ use arrow_array::builder::BufferBuilder;
 use arrow_array::*;
 use arrow_buffer::bit_util::ceil;
 use arrow_buffer::MutableBuffer;
-use arrow_data::ArrayDataBuilder;
+use arrow_data::{ArrayDataBuilder, ByteView};
 use arrow_schema::{DataType, SortOptions};
+use builder::make_view;
 
 /// The block size of the variable length encoding
 pub const BLOCK_SIZE: usize = 32;
@@ -243,6 +244,88 @@ pub fn decode_binary<I: OffsetSizeTrait>(
     unsafe { GenericBinaryArray::from(builder.build_unchecked()) }
 }
 
+fn decode_binary_view_inner(
+    rows: &mut [&[u8]],
+    options: SortOptions,
+    check_utf8: bool,
+) -> BinaryViewArray {
+    let len = rows.len();
+
+    let mut null_count = 0;
+
+    let nulls = MutableBuffer::collect_bool(len, |x| {
+        let valid = rows[x][0] != null_sentinel(options);
+        null_count += !valid as usize;
+        valid
+    });
+
+    let values_capacity: usize = rows.iter().map(|row| decoded_len(row, options)).sum();
+    let mut values = MutableBuffer::new(values_capacity);
+    let mut views = BufferBuilder::<u128>::new(len);
+
+    for row in rows {
+        let start_offset = values.len();
+        let offset = decode_blocks(row, options, |b| values.extend_from_slice(b));
+        if row[0] == null_sentinel(options) {
+            debug_assert_eq!(offset, 1);
+            debug_assert_eq!(start_offset, values.len());
+            views.append(0);
+        } else {
+            let view = make_view(
+                unsafe { values.get_unchecked(start_offset..) },
+                0,
+                start_offset as u32,
+            );
+            views.append(view);
+        }
+        *row = &row[offset..];
+    }
+
+    if options.descending {
+        values.as_slice_mut().iter_mut().for_each(|o| *o = !*o);
+        for view in views.as_slice_mut() {
+            let len = *view as u32;
+            if len <= 12 {
+                let mut bytes = view.to_le_bytes();
+                bytes
+                    .iter_mut()
+                    .skip(4)
+                    .take(len as usize)
+                    .for_each(|o| *o = !*o);
+                *view = u128::from_le_bytes(bytes);
+            } else {
+                let mut byte_view = ByteView::from(*view);
+                let mut prefix = byte_view.prefix.to_le_bytes();
+                prefix.iter_mut().for_each(|o| *o = !*o);
+                byte_view.prefix = u32::from_le_bytes(prefix);
+                *view = byte_view.into();
+            }
+        }
+    }
+
+    if check_utf8 {
+        // the values contains all data, no matter if it is short or long
+        // we can validate utf8 in one go.
+        std::str::from_utf8(values.as_slice()).unwrap();
+    }
+
+    let builder = ArrayDataBuilder::new(DataType::BinaryView)
+        .len(len)
+        .null_count(null_count)
+        .null_bit_buffer(Some(nulls.into()))
+        .add_buffer(views.finish())
+        .add_buffer(values.into());
+
+    // SAFETY:
+    // Valid by construction above
+    unsafe { BinaryViewArray::from(builder.build_unchecked()) }
+}
+
+/// Decodes a binary view array from `rows` with the provided `options`
+pub fn decode_binary_view(rows: &mut [&[u8]], options: SortOptions) -> BinaryViewArray {
+    decode_binary_view_inner(rows, options, false)
+}
+
 /// Decodes a string array from `rows` with the provided `options`
 ///
 /// # Safety
@@ -269,16 +352,6 @@ pub unsafe fn decode_string<I: OffsetSizeTrait>(
     GenericStringArray::from(builder.build_unchecked())
 }
 
-/// Decodes a binary view array from `rows` with the provided `options`
-pub fn decode_binary_view(rows: &mut [&[u8]], options: SortOptions) -> BinaryViewArray {
-    let decoded: GenericBinaryArray<i64> = decode_binary(rows, options);
-
-    // Better performance might be to directly build the binary view instead of building to BinaryArray and then casting
-    // I suspect that the overhead is not a big deal.
-    // If it is, we can reimplement the `decode_binary_view` function to directly build the StringViewArray
-    BinaryViewArray::from(&decoded)
-}
-
 /// Decodes a string view array from `rows` with the provided `options`
 ///
 /// # Safety
@@ -289,9 +362,6 @@ pub unsafe fn decode_string_view(
     options: SortOptions,
     validate_utf8: bool,
 ) -> StringViewArray {
-    let decoded: GenericStringArray<i64> = decode_string(rows, options, validate_utf8);
-    // Better performance might be to directly build the string view instead of building to StringArray and then casting
-    // I suspect that the overhead is not a big deal.
-    // If it is, we can reimplement the `decode_string_view` function to directly build the StringViewArray
-    StringViewArray::from(&decoded)
+    let view = decode_binary_view_inner(rows, options, validate_utf8);
+    view.to_string_view_unchecked()
 }
