@@ -28,6 +28,7 @@ use crate::encodings::decoding::{Decoder, DeltaBitPackDecoder};
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 use arrow_array::{builder::make_view, ArrayRef};
+use arrow_buffer::Buffer;
 use arrow_data::ByteView;
 use arrow_schema::DataType as ArrowType;
 use bytes::Bytes;
@@ -71,7 +72,6 @@ struct ByteViewArrayReader {
 }
 
 impl ByteViewArrayReader {
-    #[allow(unused)]
     fn new(
         pages: Box<dyn PageIterator>,
         data_type: ArrowType,
@@ -316,6 +316,8 @@ impl ByteViewArrayDecoderPlain {
     }
 
     pub fn read(&mut self, output: &mut ViewBuffer, len: usize) -> Result<usize> {
+        // Here we convert `bytes::Bytes` into `arrow_buffer::Bytes`, which is zero copy
+        // Then we convert `arrow_buffer::Bytes` into `arrow_buffer:Buffer`, which is also zero copy
         let buf = arrow_buffer::Buffer::from_bytes(self.buf.clone().into());
         let block_id = output.append_block(buf);
 
@@ -357,7 +359,7 @@ impl ByteViewArrayDecoderPlain {
                 //     I.e., the validation cannot validate the buffer in one pass, but instead, validate strings chunk by chunk.
                 //
                 // Given the above observations, the goal is to do batch validation as much as possible.
-                // The key idea is that if the length is smaller than 128 (99% of the case), then the length bytes are valid utf-8, as reasoned blow:
+                // The key idea is that if the length is smaller than 128 (99% of the case), then the length bytes are valid utf-8, as reasoned below:
                 // If the length is smaller than 128, its 4-byte encoding are [0, 0, 0, len].
                 // Each of the byte is a valid ASCII character, so they are valid utf-8.
                 // Since they are all smaller than 128, the won't break a utf-8 code point (won't mess with later bytes).
@@ -515,6 +517,23 @@ impl ByteViewArrayDecoderDeltaLength {
         let mut lengths = vec![0; values];
         len_decoder.get(&mut lengths)?;
 
+        let mut total_bytes = 0;
+
+        for l in lengths.iter() {
+            if *l < 0 {
+                return Err(ParquetError::General(
+                    "negative delta length byte array length".to_string(),
+                ));
+            }
+            total_bytes += *l as usize;
+        }
+
+        if total_bytes + len_decoder.get_offset() > data.len() {
+            return Err(ParquetError::General(
+                "Insufficient delta length byte array bytes".to_string(),
+            ));
+        }
+
         Ok(Self {
             lengths,
             data,
@@ -530,33 +549,29 @@ impl ByteViewArrayDecoderDeltaLength {
 
         let src_lengths = &self.lengths[self.length_offset..self.length_offset + to_read];
 
-        let total_bytes: usize = src_lengths.iter().map(|x| *x as usize).sum();
+        // Here we convert `bytes::Bytes` into `arrow_buffer::Bytes`, which is zero copy
+        // Then we convert `arrow_buffer::Bytes` into `arrow_buffer:Buffer`, which is also zero copy
+        let bytes = arrow_buffer::Buffer::from_bytes(self.data.clone().into());
+        let block_id = output.append_block(bytes);
 
-        if self.data_offset + total_bytes > self.data.len() {
-            return Err(ParquetError::EOF(
-                "Insufficient delta length byte array bytes".to_string(),
-            ));
-        }
-
-        let block_id = output.append_block(self.data.clone().into());
-
-        let mut start_offset = self.data_offset;
-        let initial_offset = start_offset;
+        let mut current_offset = self.data_offset;
+        let initial_offset = current_offset;
         for length in src_lengths {
             // # Safety
             // The length is from the delta length decoder, so it is valid
             // The start_offset is calculated from the lengths, so it is valid
-            unsafe { output.append_view_unchecked(block_id, start_offset as u32, *length as u32) }
+            // `start_offset + length` is guaranteed to be within the bounds of `data`, as checked in `new`
+            unsafe { output.append_view_unchecked(block_id, current_offset as u32, *length as u32) }
 
-            start_offset += *length as usize;
+            current_offset += *length as usize;
         }
 
         // Delta length encoding has continuous strings, we can validate utf8 in one go
         if self.validate_utf8 {
-            check_valid_utf8(&self.data[initial_offset..start_offset])?;
+            check_valid_utf8(&self.data[initial_offset..current_offset])?;
         }
 
-        self.data_offset = start_offset;
+        self.data_offset = current_offset;
         self.length_offset += to_read;
 
         Ok(to_read)
@@ -589,32 +604,70 @@ impl ByteViewArrayDecoderDelta {
         })
     }
 
-    // Unlike other encodings, we need to copy the data because we can not reuse the DeltaByteArray data in Arrow.
+    // Unlike other encodings, we need to copy the data.
+    //
+    //  DeltaByteArray data is stored using shared prefixes/suffixes,
+    // which results in potentially non-contiguous
+    // strings, while Arrow encodings require contiguous strings
+    //
+    // <https://parquet.apache.org/docs/file-format/data-pages/encodings/#delta-strings-delta_byte_array--7>
+
     fn read(&mut self, output: &mut ViewBuffer, len: usize) -> Result<usize> {
         output.views.reserve(len.min(self.decoder.remaining()));
 
-        let mut buffer: Vec<u8> = Vec::with_capacity(4096);
+        // array buffer only have long strings
+        let mut array_buffer: Vec<u8> = Vec::with_capacity(4096);
 
         let buffer_id = output.buffers.len() as u32;
 
-        let read = self.decoder.read(len, |bytes| {
-            let offset = buffer.len();
-            buffer.extend_from_slice(bytes);
-            let view = make_view(bytes, buffer_id, offset as u32);
-            // # Safety
-            // The buffer_id is the last buffer in the output buffers
-            // The offset is calculated from the buffer, so it is valid
-            unsafe {
-                output.append_raw_view_unchecked(&view);
-            }
-            Ok(())
-        })?;
+        let read = if !self.validate_utf8 {
+            self.decoder.read(len, |bytes| {
+                let offset = array_buffer.len();
+                let view = make_view(bytes, buffer_id, offset as u32);
+                if bytes.len() > 12 {
+                    // only copy the data to buffer if the string can not be inlined.
+                    array_buffer.extend_from_slice(bytes);
+                }
 
-        // The buffer is dense, so we can validate utf8 in one go
-        if self.validate_utf8 {
-            check_valid_utf8(&buffer)?;
-        }
-        let actual_block_id = output.append_block(buffer.into());
+                // # Safety
+                // The buffer_id is the last buffer in the output buffers
+                // The offset is calculated from the buffer, so it is valid
+                unsafe {
+                    output.append_raw_view_unchecked(&view);
+                }
+                Ok(())
+            })?
+        } else {
+            // utf8 validation buffer has only short strings. These short
+            // strings are inlined into the views but we copy them into a
+            // contiguous buffer to accelerate validation.®
+            let mut utf8_validation_buffer = Vec::with_capacity(4096);
+
+            let v = self.decoder.read(len, |bytes| {
+                let offset = array_buffer.len();
+                let view = make_view(bytes, buffer_id, offset as u32);
+                if bytes.len() > 12 {
+                    // only copy the data to buffer if the string can not be inlined.
+                    array_buffer.extend_from_slice(bytes);
+                } else {
+                    utf8_validation_buffer.extend_from_slice(bytes);
+                }
+
+                // # Safety
+                // The buffer_id is the last buffer in the output buffers
+                // The offset is calculated from the buffer, so it is valid
+                // Utf-8 validation is done later
+                unsafe {
+                    output.append_raw_view_unchecked(&view);
+                }
+                Ok(())
+            })?;
+            check_valid_utf8(&array_buffer)?;
+            check_valid_utf8(&utf8_validation_buffer)?;
+            v
+        };
+
+        let actual_block_id = output.append_block(Buffer::from_vec(array_buffer));
         assert_eq!(actual_block_id, buffer_id);
         Ok(read)
     }
