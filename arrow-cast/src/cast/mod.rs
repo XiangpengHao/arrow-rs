@@ -207,6 +207,7 @@ pub fn can_cast_types(from_type: &DataType, to_type: &DataType) -> bool {
         }
 
         (Binary, LargeBinary | Utf8 | LargeUtf8 | FixedSizeBinary(_) | BinaryView) => true,
+        (BinaryView, Binary | LargeBinary | Utf8 | LargeUtf8 | Utf8View) => true,
         (LargeBinary, Binary | Utf8 | LargeUtf8 | FixedSizeBinary(_) | BinaryView) => true,
         (FixedSizeBinary(_), Binary | LargeBinary) => true,
         (
@@ -228,7 +229,6 @@ pub fn can_cast_types(from_type: &DataType, to_type: &DataType) -> bool {
             | Interval(_),
         ) => true,
         (Utf8 | LargeUtf8, Utf8View) => true,
-        (BinaryView, Binary | LargeBinary) => true,
         (Utf8 | LargeUtf8, _) => to_type.is_numeric() && to_type != &Float16,
         (_, Utf8 | LargeUtf8) => from_type.is_primitive(),
 
