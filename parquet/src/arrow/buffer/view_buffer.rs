@@ -70,14 +70,18 @@ impl ViewBuffer {
     /// Converts this into an [`ArrayRef`] with the provided `data_type` and `null_buffer`
     pub fn into_array(self, null_buffer: Option<Buffer>, data_type: &ArrowType) -> ArrayRef {
         let len = self.views.len();
+        let need_buffer = self.views.iter().any(|v| (*v as u32) > 12);
         let views = Buffer::from_vec(self.views);
         match data_type {
             ArrowType::Utf8View => {
-                let builder = ArrayDataBuilder::new(ArrowType::Utf8View)
+                let mut builder = ArrayDataBuilder::new(ArrowType::Utf8View)
                     .len(len)
                     .add_buffer(views)
-                    .add_buffers(self.buffers)
+                    // .add_buffers(self.buffers)
                     .null_bit_buffer(null_buffer);
+                if need_buffer {
+                    builder = builder.add_buffers(self.buffers);
+                }
                 // We have checked that the data is utf8 when building the buffer, so it is safe
                 let array = unsafe { builder.build_unchecked() };
                 make_array(array)
