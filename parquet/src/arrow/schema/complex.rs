@@ -78,6 +78,14 @@ impl ParquetField {
             ParquetFieldType::Group { children } => Some(children),
         }
     }
+
+    /// Returns the column index if this is a primitive type
+    pub fn column_index_if_primitive(&self) -> Option<usize> {
+        match &self.field_type {
+            ParquetFieldType::Primitive { col_idx, .. } => Some(*col_idx),
+            ParquetFieldType::Group { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

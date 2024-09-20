@@ -578,10 +578,26 @@ where
             .fetch(&mut self.input, &projection, selection.as_ref())
             .await?;
 
-        let reader = ParquetRecordBatchReader::new(
+        let parquet_column_index = projection
+            .mask
+            .as_ref()
+            .map(|m| {
+                let true_count = m.iter().filter(|&b| *b).count();
+                if true_count > 1 {
+                    None
+                } else {
+                    Some(m.iter().position(|b| *b).unwrap())
+                }
+            })
+            .flatten();
+
+        let reader = ParquetRecordBatchReader::new_with_parquet_column_index(
             batch_size,
             build_array_reader(self.fields.as_deref(), &projection, &row_group)?,
+            parquet_column_index,
             selection,
+            row_group_idx,
+            0,
         );
 
         Ok((self, Some(reader)))
