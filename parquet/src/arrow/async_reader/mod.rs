@@ -120,6 +120,8 @@ use crate::arrow::schema::ParquetField;
 #[cfg(feature = "object_store")]
 pub use store::*;
 
+use super::array_reader::build_cached_array_reader;
+
 /// The asynchronous interface used by [`ParquetRecordBatchStream`] to read parquet files
 ///
 /// Notes:
@@ -472,7 +474,7 @@ type ReadResult<T> = Result<(ReaderFactory<T>, Option<ParquetRecordBatchReader>)
 
 /// [`ReaderFactory`] is used by [`ParquetRecordBatchStream`] to create
 /// [`ParquetRecordBatchReader`]
-struct ReaderFactory<T> {
+pub struct ReaderFactory<T> {
     metadata: Arc<ParquetMetaData>,
 
     fields: Option<Arc<ParquetField>>,
@@ -578,26 +580,15 @@ where
             .fetch(&mut self.input, &projection, selection.as_ref())
             .await?;
 
-        let parquet_column_index = projection
-            .mask
-            .as_ref()
-            .map(|m| {
-                let true_count = m.iter().filter(|&b| *b).count();
-                if true_count > 1 {
-                    None
-                } else {
-                    Some(m.iter().position(|b| *b).unwrap())
-                }
-            })
-            .flatten();
-
-        let reader = ParquetRecordBatchReader::new_with_parquet_column_index(
+        let reader = ParquetRecordBatchReader::new(
             batch_size,
-            build_array_reader(self.fields.as_deref(), &projection, &row_group)?,
-            parquet_column_index,
+            build_cached_array_reader(
+                self.fields.as_deref(),
+                &projection,
+                &row_group,
+                row_group_idx,
+            )?,
             selection,
-            row_group_idx,
-            0,
         );
 
         Ok((self, Some(reader)))

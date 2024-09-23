@@ -46,6 +46,7 @@ mod struct_array;
 mod test_util;
 
 pub use builder::build_array_reader;
+pub use builder::build_cached_array_reader;
 pub use byte_array::make_byte_array_reader;
 pub use byte_array_dictionary::make_byte_array_dictionary_reader;
 #[allow(unused_imports)] // Only used for benchmarks

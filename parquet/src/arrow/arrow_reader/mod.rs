@@ -17,11 +17,11 @@
 
 //! Contains reader which reads parquet data into arrow [`RecordBatch`]
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::collections::VecDeque;
+use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef};
+use arrow_array::Array;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType as ArrowType, Schema, SchemaRef};
 use arrow_select::filter::prep_null_mask_filter;
@@ -684,67 +684,6 @@ impl<T: ChunkReader + 'static> Iterator for ReaderPageIterator<T> {
 
 impl<T: ChunkReader + 'static> PageIterator for ReaderPageIterator<T> {}
 
-static ARROW_ARRAY_CACHE: LazyLock<ArrowArrayCache> = LazyLock::new(|| ArrowArrayCache::new());
-
-/// Row offset -> Arrow Array
-type RowMapping = HashMap<usize, ArrayRef>;
-
-/// Column offset -> RowMapping
-type ColumnMapping = HashMap<usize, RowMapping>;
-
-pub struct ArrowArrayCache {
-    /// Row group index -> (Parquet column index -> (row starting index -> arrow array))
-    value: RwLock<HashMap<usize, ColumnMapping>>,
-}
-
-struct ArrayIdentifier {
-    row_group_id: usize,
-    column_id: usize,
-    row_id: usize, // followed by the batch size
-}
-
-impl ArrayIdentifier {
-    fn new(row_group_id: usize, column_id: usize, row_id: usize) -> Self {
-        Self {
-            row_group_id,
-            column_id,
-            row_id,
-        }
-    }
-}
-
-impl ArrowArrayCache {
-    fn new() -> Self {
-        Self {
-            value: RwLock::new(HashMap::new()),
-        }
-    }
-
-    fn get() -> &'static ArrowArrayCache {
-        &ARROW_ARRAY_CACHE
-    }
-
-    fn get_arrow_array(&self, id: &ArrayIdentifier) -> Option<ArrayRef> {
-        let cache = self.value.read().unwrap();
-
-        let row_group_cache = cache.get(&id.row_group_id)?;
-        let column_cache = row_group_cache.get(&id.column_id)?;
-
-        column_cache.get(&id.row_id).cloned()
-    }
-
-    fn insert_arrow_array(&self, id: &ArrayIdentifier, array: ArrayRef) {
-        let mut cache = self.value.write().unwrap();
-
-        let row_group_cache = cache.entry(id.row_group_id).or_insert_with(HashMap::new);
-        let column_cache = row_group_cache
-            .entry(id.column_id)
-            .or_insert_with(HashMap::new);
-
-        column_cache.insert(id.row_id, array);
-    }
-}
-
 /// An `Iterator<Item = ArrowResult<RecordBatch>>` that yields [`RecordBatch`]
 /// read from a parquet data source
 pub struct ParquetRecordBatchReader {
@@ -752,9 +691,6 @@ pub struct ParquetRecordBatchReader {
     array_reader: Box<dyn ArrayReader>,
     schema: SchemaRef,
     selection: Option<VecDeque<RowSelector>>,
-    row_group_id: usize,
-    current_row_id: usize,
-    parquet_column_index: Option<usize>,
 }
 
 impl Iterator for ParquetRecordBatchReader {
@@ -808,23 +744,8 @@ impl Iterator for ParquetRecordBatchReader {
                 }
             }
             None => {
-                // try to get from cache first
-                if let Some(parquet_column_index) = self.parquet_column_index {
-                    let cached = ArrowArrayCache::get().get_arrow_array(&ArrayIdentifier::new(
-                        self.row_group_id,
-                        parquet_column_index,
-                        self.current_row_id,
-                    ));
-                    if let Some(cached) = cached {
-                        assert!(cached.len() <= self.batch_size);
-                        self.array_reader.skip_records(cached.len()).unwrap();
-                        let struct_array = cached.as_struct_opt().unwrap();
-                        return Some(Ok(RecordBatch::from(struct_array)));
-                    }
-                }
-                match self.array_reader.read_records(self.batch_size) {
-                    Ok(read) => self.current_row_id += read,
-                    Err(error) => return Some(Err(error.into())),
+                if let Err(e) = self.array_reader.read_records(self.batch_size) {
+                    return Some(Err(e.into()));
                 }
             }
         };
@@ -840,17 +761,7 @@ impl Iterator for ParquetRecordBatchReader {
 
                 match struct_array {
                     Err(err) => Some(Err(err)),
-                    Ok(e) => (e.len() > 0).then(|| {
-                        if let Some(parquet_column_index) = self.parquet_column_index {
-                            let id = ArrayIdentifier::new(
-                                self.row_group_id,
-                                parquet_column_index,
-                                self.current_row_id - e.len(),
-                            );
-                            ArrowArrayCache::get().insert_arrow_array(&id, Arc::new(e.clone()));
-                        }
-                        Ok(RecordBatch::from(e))
-                    }),
+                    Ok(e) => (e.len() > 0).then(|| Ok(RecordBatch::from(e))),
                 }
             }
         }
@@ -895,9 +806,6 @@ impl ParquetRecordBatchReader {
             array_reader,
             schema: Arc::new(Schema::new(levels.fields.clone())),
             selection: selection.map(|s| s.trim().into()),
-            current_row_id: 0,
-            row_group_id: 0,
-            parquet_column_index: None,
         })
     }
 
@@ -919,25 +827,7 @@ impl ParquetRecordBatchReader {
             array_reader,
             schema: Arc::new(schema),
             selection: selection.map(|s| s.trim().into()),
-            current_row_id: 0,
-            row_group_id: 0,
-            parquet_column_index: None,
         }
-    }
-
-    pub(crate) fn new_with_parquet_column_index(
-        batch_size: usize,
-        array_reader: Box<dyn ArrayReader>,
-        parquet_column_index: Option<usize>,
-        selection: Option<RowSelection>,
-        row_group_id: usize,
-        current_row_id: usize,
-    ) -> Self {
-        let mut reader = Self::new(batch_size, array_reader, selection);
-        reader.parquet_column_index = parquet_column_index;
-        reader.row_group_id = row_group_id;
-        reader.current_row_id = current_row_id;
-        reader
     }
 }
 
