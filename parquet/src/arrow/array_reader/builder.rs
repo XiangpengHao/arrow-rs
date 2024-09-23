@@ -15,8 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
+use std::any::Any;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, RwLock};
 
+use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Fields, SchemaBuilder};
 
 use crate::arrow::array_reader::byte_view_array::make_byte_view_array_reader;
@@ -33,6 +36,167 @@ use crate::basic::Type as PhysicalType;
 use crate::data_type::{BoolType, DoubleType, FloatType, Int32Type, Int64Type, Int96Type};
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::{ColumnDescriptor, ColumnPath, Type};
+
+static ARROW_ARRAY_CACHE: LazyLock<ArrowArrayCache> = LazyLock::new(|| ArrowArrayCache::new());
+
+/// Row offset -> Arrow Array
+type RowMapping = HashMap<usize, ArrayRef>;
+
+/// Column offset -> RowMapping
+type ColumnMapping = HashMap<usize, RowMapping>;
+
+pub struct ArrowArrayCache {
+    /// Row group index -> (Parquet column index -> (row starting index -> arrow array))
+    value: RwLock<HashMap<usize, ColumnMapping>>,
+}
+
+struct ArrayIdentifier {
+    row_group_id: usize,
+    column_id: usize,
+    row_id: usize, // followed by the batch size
+}
+
+impl ArrayIdentifier {
+    fn new(row_group_id: usize, column_id: usize, row_id: usize) -> Self {
+        Self {
+            row_group_id,
+            column_id,
+            row_id,
+        }
+    }
+}
+
+impl ArrowArrayCache {
+    fn new() -> Self {
+        Self {
+            value: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn get() -> &'static ArrowArrayCache {
+        &ARROW_ARRAY_CACHE
+    }
+
+    fn get_arrow_array(&self, id: &ArrayIdentifier) -> Option<ArrayRef> {
+        let cache = self.value.read().unwrap();
+
+        let row_group_cache = cache.get(&id.row_group_id)?;
+        let column_cache = row_group_cache.get(&id.column_id)?;
+
+        column_cache.get(&id.row_id).cloned()
+    }
+
+    fn insert_arrow_array(&self, id: &ArrayIdentifier, array: ArrayRef) {
+        let mut cache = self.value.write().unwrap();
+
+        let row_group_cache = cache.entry(id.row_group_id).or_insert_with(HashMap::new);
+        let column_cache = row_group_cache
+            .entry(id.column_id)
+            .or_insert_with(HashMap::new);
+
+        column_cache.insert(id.row_id, array);
+    }
+}
+
+struct CachedArrayReader {
+    inner: Box<dyn ArrayReader>,
+    current_row_id: usize,
+    column_id: Option<usize>,
+    row_group_id: usize,
+    current_cached: Option<ArrayRef>,
+}
+
+impl CachedArrayReader {
+    fn new(inner: Box<dyn ArrayReader>, row_group_id: usize, column_id: Option<usize>) -> Self {
+        Self {
+            inner,
+            current_row_id: 0,
+            row_group_id,
+            column_id,
+            current_cached: None,
+        }
+    }
+}
+
+impl ArrayReader for CachedArrayReader {
+    fn as_any(&self) -> &dyn Any {
+        self.inner.as_any()
+    }
+
+    fn get_data_type(&self) -> &DataType {
+        self.inner.get_data_type()
+    }
+
+    fn read_records(&mut self, batch_size: usize) -> Result<usize> {
+        if let Some(column_id) = self.column_id {
+            let batch_id = ArrayIdentifier::new(self.row_group_id, column_id, self.current_row_id);
+            if let Some(cached_array) = ArrowArrayCache::get().get_arrow_array(&batch_id) {
+                let cached_len = cached_array.len();
+                self.current_cached = Some(cached_array);
+                self.skip_records(cached_len)?;
+                return Ok(cached_len);
+            }
+        }
+        let records_read = self.inner.read_records(batch_size)?;
+        Ok(records_read)
+    }
+
+    fn consume_batch(&mut self) -> Result<ArrayRef> {
+        if let Some(cached_array) = self.current_cached.take() {
+            self.current_row_id += cached_array.len();
+            return Ok(cached_array);
+        }
+
+        let records = self.inner.consume_batch()?;
+
+        if let Some(column_id) = self.column_id {
+            let batch_id = ArrayIdentifier::new(self.row_group_id, column_id, self.current_row_id);
+            ArrowArrayCache::get().insert_arrow_array(&batch_id, records.clone());
+        }
+        self.current_row_id += records.len();
+        Ok(records)
+    }
+
+    fn skip_records(&mut self, num_records: usize) -> Result<usize> {
+        self.inner.skip_records(num_records)?;
+        self.current_row_id += num_records;
+        Ok(num_records)
+    }
+
+    fn get_def_levels(&self) -> Option<&[i16]> {
+        self.inner.get_def_levels()
+    }
+
+    fn get_rep_levels(&self) -> Option<&[i16]> {
+        self.inner.get_rep_levels()
+    }
+}
+
+pub fn build_cached_array_reader(
+    field: Option<&ParquetField>,
+    mask: &ProjectionMask,
+    row_groups: &dyn RowGroups,
+    row_group_idx: usize,
+) -> Result<Box<dyn ArrayReader>> {
+    let reader = build_array_reader(field, mask, row_groups)?;
+    let column_id = mask
+        .mask
+        .as_ref()
+        .map(|m| {
+            let true_count = m.iter().filter(|&b| *b).count();
+            if true_count > 1 {
+                None
+            } else {
+                Some(m.iter().position(|b| *b).unwrap())
+            }
+        })
+        .flatten();
+    Ok(Box::new(CachedArrayReader::new(
+        reader,
+        row_group_idx,
+        column_id,
+    )))
+}
 
 /// Create array reader from parquet schema, projection mask, and parquet file reader.
 pub fn build_array_reader(
