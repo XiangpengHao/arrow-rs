@@ -580,16 +580,14 @@ where
             .fetch(&mut self.input, &projection, selection.as_ref())
             .await?;
 
-        let reader = ParquetRecordBatchReader::new(
-            batch_size,
-            build_cached_array_reader(
-                self.fields.as_deref(),
-                &projection,
-                &row_group,
-                row_group_idx,
-            )?,
-            selection,
-        );
+        let cached_reader = build_cached_array_reader(
+            self.fields.as_deref(),
+            &projection,
+            &row_group,
+            row_group_idx,
+        )?;
+
+        let reader = ParquetRecordBatchReader::new(batch_size, cached_reader, selection);
 
         Ok((self, Some(reader)))
     }
