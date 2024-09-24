@@ -101,13 +101,13 @@ impl ArrowArrayCache {
 struct CachedArrayReader {
     inner: Box<dyn ArrayReader>,
     current_row_id: usize,
-    column_id: Option<usize>,
+    column_id: usize,
     row_group_id: usize,
     current_cached: Option<ArrayRef>,
 }
 
 impl CachedArrayReader {
-    fn new(inner: Box<dyn ArrayReader>, row_group_id: usize, column_id: Option<usize>) -> Self {
+    fn new(inner: Box<dyn ArrayReader>, row_group_id: usize, column_id: usize) -> Self {
         Self {
             inner,
             current_row_id: 0,
@@ -128,14 +128,12 @@ impl ArrayReader for CachedArrayReader {
     }
 
     fn read_records(&mut self, batch_size: usize) -> Result<usize> {
-        if let Some(column_id) = self.column_id {
-            let batch_id = ArrayIdentifier::new(self.row_group_id, column_id, self.current_row_id);
-            if let Some(cached_array) = ArrowArrayCache::get().get_arrow_array(&batch_id) {
-                let cached_len = cached_array.len();
-                self.current_cached = Some(cached_array);
-                self.skip_records(cached_len)?;
-                return Ok(cached_len);
-            }
+        let batch_id = ArrayIdentifier::new(self.row_group_id, self.column_id, self.current_row_id);
+        if let Some(cached_array) = ArrowArrayCache::get().get_arrow_array(&batch_id) {
+            let cached_len = cached_array.len();
+            self.current_cached = Some(cached_array);
+            self.skip_records(cached_len)?;
+            return Ok(cached_len);
         }
         let records_read = self.inner.read_records(batch_size)?;
         Ok(records_read)
@@ -149,10 +147,8 @@ impl ArrayReader for CachedArrayReader {
 
         let records = self.inner.consume_batch()?;
 
-        if let Some(column_id) = self.column_id {
-            let batch_id = ArrayIdentifier::new(self.row_group_id, column_id, self.current_row_id);
-            ArrowArrayCache::get().insert_arrow_array(&batch_id, records.clone());
-        }
+        let batch_id = ArrayIdentifier::new(self.row_group_id, self.column_id, self.current_row_id);
+        ArrowArrayCache::get().insert_arrow_array(&batch_id, records.clone());
         self.current_row_id += records.len();
         Ok(records)
     }
@@ -178,24 +174,11 @@ pub fn build_cached_array_reader(
     row_groups: &dyn RowGroups,
     row_group_idx: usize,
 ) -> Result<Box<dyn ArrayReader>> {
-    let reader = build_array_reader(field, mask, row_groups)?;
-    let column_id = mask
-        .mask
-        .as_ref()
-        .map(|m| {
-            let true_count = m.iter().filter(|&b| *b).count();
-            if true_count > 1 {
-                None
-            } else {
-                Some(m.iter().position(|b| *b).unwrap())
-            }
-        })
-        .flatten();
-    Ok(Box::new(CachedArrayReader::new(
-        reader,
-        row_group_idx,
-        column_id,
-    )))
+    let reader = field
+        .and_then(|field| build_reader(field, mask, row_groups, Some(row_group_idx)).transpose())
+        .transpose()?
+        .unwrap_or_else(|| make_empty_array_reader(row_groups.num_rows()));
+    Ok(reader)
 }
 
 /// Create array reader from parquet schema, projection mask, and parquet file reader.
@@ -205,7 +188,7 @@ pub fn build_array_reader(
     row_groups: &dyn RowGroups,
 ) -> Result<Box<dyn ArrayReader>> {
     let reader = field
-        .and_then(|field| build_reader(field, mask, row_groups).transpose())
+        .and_then(|field| build_reader(field, mask, row_groups, None).transpose())
         .transpose()?
         .unwrap_or_else(|| make_empty_array_reader(row_groups.num_rows()));
 
@@ -216,15 +199,22 @@ fn build_reader(
     field: &ParquetField,
     mask: &ProjectionMask,
     row_groups: &dyn RowGroups,
+    row_group_idx: Option<usize>,
 ) -> Result<Option<Box<dyn ArrayReader>>> {
     match field.field_type {
-        ParquetFieldType::Primitive { .. } => build_primitive_reader(field, mask, row_groups),
+        ParquetFieldType::Primitive { .. } => {
+            build_primitive_reader(field, mask, row_groups, row_group_idx)
+        }
         ParquetFieldType::Group { .. } => match &field.arrow_type {
-            DataType::Map(_, _) => build_map_reader(field, mask, row_groups),
-            DataType::Struct(_) => build_struct_reader(field, mask, row_groups),
-            DataType::List(_) => build_list_reader(field, mask, false, row_groups),
-            DataType::LargeList(_) => build_list_reader(field, mask, true, row_groups),
-            DataType::FixedSizeList(_, _) => build_fixed_size_list_reader(field, mask, row_groups),
+            DataType::Map(_, _) => build_map_reader(field, mask, row_groups, row_group_idx),
+            DataType::Struct(_) => build_struct_reader(field, mask, row_groups, row_group_idx),
+            DataType::List(_) => build_list_reader(field, mask, false, row_groups, row_group_idx),
+            DataType::LargeList(_) => {
+                build_list_reader(field, mask, true, row_groups, row_group_idx)
+            }
+            DataType::FixedSizeList(_, _) => {
+                build_fixed_size_list_reader(field, mask, row_groups, row_group_idx)
+            }
             d => unimplemented!("reading group type {} not implemented", d),
         },
     }
@@ -235,12 +225,13 @@ fn build_map_reader(
     field: &ParquetField,
     mask: &ProjectionMask,
     row_groups: &dyn RowGroups,
+    row_group_idx: Option<usize>,
 ) -> Result<Option<Box<dyn ArrayReader>>> {
     let children = field.children().unwrap();
     assert_eq!(children.len(), 2);
 
-    let key_reader = build_reader(&children[0], mask, row_groups)?;
-    let value_reader = build_reader(&children[1], mask, row_groups)?;
+    let key_reader = build_reader(&children[0], mask, row_groups, row_group_idx)?;
+    let value_reader = build_reader(&children[1], mask, row_groups, row_group_idx)?;
 
     match (key_reader, value_reader) {
         (Some(key_reader), Some(value_reader)) => {
@@ -287,11 +278,12 @@ fn build_list_reader(
     mask: &ProjectionMask,
     is_large: bool,
     row_groups: &dyn RowGroups,
+    row_group_idx: Option<usize>,
 ) -> Result<Option<Box<dyn ArrayReader>>> {
     let children = field.children().unwrap();
     assert_eq!(children.len(), 1);
 
-    let reader = match build_reader(&children[0], mask, row_groups)? {
+    let reader = match build_reader(&children[0], mask, row_groups, row_group_idx)? {
         Some(item_reader) => {
             // Need to retrieve underlying data type to handle projection
             let item_type = item_reader.get_data_type().clone();
@@ -333,11 +325,12 @@ fn build_fixed_size_list_reader(
     field: &ParquetField,
     mask: &ProjectionMask,
     row_groups: &dyn RowGroups,
+    row_group_idx: Option<usize>,
 ) -> Result<Option<Box<dyn ArrayReader>>> {
     let children = field.children().unwrap();
     assert_eq!(children.len(), 1);
 
-    let reader = match build_reader(&children[0], mask, row_groups)? {
+    let reader = match build_reader(&children[0], mask, row_groups, row_group_idx)? {
         Some(item_reader) => {
             let item_type = item_reader.get_data_type().clone();
             let reader = match &field.arrow_type {
@@ -370,6 +363,7 @@ fn build_primitive_reader(
     field: &ParquetField,
     mask: &ProjectionMask,
     row_groups: &dyn RowGroups,
+    row_group_idx: Option<usize>,
 ) -> Result<Option<Box<dyn ArrayReader>>> {
     let (col_idx, primitive_type) = match &field.field_type {
         ParquetFieldType::Primitive {
@@ -457,6 +451,11 @@ fn build_primitive_reader(
             make_fixed_len_byte_array_reader(page_iterator, column_desc, arrow_type)?
         }
     };
+    let reader = if let Some(row_group_idx) = row_group_idx {
+        Box::new(CachedArrayReader::new(reader, row_group_idx, col_idx)) as _
+    } else {
+        reader
+    };
     Ok(Some(reader))
 }
 
@@ -464,6 +463,7 @@ fn build_struct_reader(
     field: &ParquetField,
     mask: &ProjectionMask,
     row_groups: &dyn RowGroups,
+    row_group_idx: Option<usize>,
 ) -> Result<Option<Box<dyn ArrayReader>>> {
     let arrow_fields = match &field.arrow_type {
         DataType::Struct(children) => children,
@@ -476,7 +476,7 @@ fn build_struct_reader(
     let mut builder = SchemaBuilder::with_capacity(children.len());
 
     for (arrow, parquet) in arrow_fields.iter().zip(children) {
-        if let Some(reader) = build_reader(parquet, mask, row_groups)? {
+        if let Some(reader) = build_reader(parquet, mask, row_groups, row_group_idx)? {
             // Need to retrieve underlying data type to handle projection
             let child_type = reader.get_data_type().clone();
             builder.push(arrow.as_ref().clone().with_data_type(child_type));
