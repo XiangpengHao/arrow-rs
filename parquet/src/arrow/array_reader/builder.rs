@@ -16,11 +16,31 @@
 // under the License.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, RwLock};
 
-use arrow_array::ArrayRef;
-use arrow_schema::{DataType, Fields, SchemaBuilder};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{
+    Date32Type as ArrowDate32Type, Date64Type as ArrowDate64Type, Int16Type as ArrowInt16Type,
+    Int32Type as ArrowInt32Type, Int64Type as ArrowInt64Type, Int8Type as ArrowInt8Type,
+    UInt16Type as ArrowUInt16Type, UInt32Type as ArrowUInt32Type, UInt64Type as ArrowUInt64Type,
+    UInt8Type as ArrowUInt8Type,
+};
+use arrow_array::RecordBatchWriter;
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_ipc::reader::FileReader;
+use arrow_ipc::writer::FileWriter;
+use arrow_schema::{DataType, Field, Fields, Schema, SchemaBuilder};
+use vortex::arrow::FromArrowArray;
+use vortex::IntoCanonical;
+use vortex_sampling_compressor::compressors::alp::ALPCompressor;
+use vortex_sampling_compressor::compressors::bitpacked::BitPackedCompressor;
+use vortex_sampling_compressor::compressors::delta::DeltaCompressor;
+use vortex_sampling_compressor::compressors::dict::DictCompressor;
+use vortex_sampling_compressor::compressors::fsst::FSSTCompressor;
+use vortex_sampling_compressor::compressors::r#for::FoRCompressor;
+use vortex_sampling_compressor::compressors::CompressorRef;
+use vortex_sampling_compressor::SamplingCompressor;
 
 use crate::arrow::array_reader::byte_view_array::make_byte_view_array_reader;
 use crate::arrow::array_reader::empty_array::make_empty_array_reader;
@@ -40,14 +60,29 @@ use crate::schema::types::{ColumnDescriptor, ColumnPath, Type};
 static ARROW_ARRAY_CACHE: LazyLock<ArrowArrayCache> = LazyLock::new(|| ArrowArrayCache::new());
 
 /// Row offset -> Arrow Array
-type RowMapping = HashMap<usize, ArrayRef>;
+type RowMapping = HashMap<usize, CachedEntry>;
 
 /// Column offset -> RowMapping
 type ColumnMapping = HashMap<usize, RowMapping>;
 
+enum CachedEntry {
+    InMemory(ArrayRef),
+    Vortex(vortex::Array),
+    OnDisk(String),
+}
+
+#[derive(Debug, Clone)]
+enum ArrowCacheMode {
+    InMemory,
+    OnDisk,
+    NoCache,
+    Vortex(SamplingCompressor<'static>),
+}
+
 pub struct ArrowArrayCache {
     /// Row group index -> (Parquet column index -> (row starting index -> arrow array))
     value: RwLock<HashMap<usize, ColumnMapping>>,
+    cache_mode: ArrowCacheMode,
 }
 
 struct ArrayIdentifier {
@@ -70,6 +105,25 @@ impl ArrowArrayCache {
     fn new() -> Self {
         Self {
             value: RwLock::new(HashMap::new()),
+            cache_mode: std::env::var("ARROW_CACHE_MODE").map_or(ArrowCacheMode::NoCache, |v| {
+                match v.to_lowercase().as_str() {
+                    "disk" => ArrowCacheMode::OnDisk,
+                    "inmemory" => ArrowCacheMode::InMemory,
+                    "nocache" => ArrowCacheMode::NoCache,
+                    "vortex" => ArrowCacheMode::Vortex(SamplingCompressor::new_with_options(
+                        HashSet::from([
+                            &ALPCompressor as CompressorRef,
+                            &BitPackedCompressor,
+                            &DeltaCompressor,
+                            &DictCompressor,
+                            &FoRCompressor,
+                            &FSSTCompressor,
+                        ]),
+                        Default::default(),
+                    )),
+                    _ => ArrowCacheMode::NoCache,
+                }
+            }),
         }
     }
 
@@ -78,15 +132,42 @@ impl ArrowArrayCache {
     }
 
     fn get_arrow_array(&self, id: &ArrayIdentifier) -> Option<ArrayRef> {
+        if matches!(self.cache_mode, ArrowCacheMode::NoCache) {
+            return None;
+        }
+
         let cache = self.value.read().unwrap();
 
         let row_group_cache = cache.get(&id.row_group_id)?;
         let column_cache = row_group_cache.get(&id.column_id)?;
 
-        column_cache.get(&id.row_id).cloned()
+        let cached = column_cache.get(&id.row_id)?;
+        match cached {
+            CachedEntry::InMemory(array) => Some(array.clone()),
+            CachedEntry::OnDisk(path) => {
+                let file = std::fs::File::open(path).ok()?;
+                let reader = std::io::BufReader::new(file);
+                let mut arrow_reader = FileReader::try_new(reader, None).ok()?;
+                let batch = arrow_reader.next().unwrap().unwrap();
+                Some(batch.column(0).clone())
+            }
+            CachedEntry::Vortex(array) => {
+                let canonical_array = array
+                    .clone()
+                    .into_canonical()
+                    .unwrap()
+                    .into_arrow()
+                    .unwrap();
+                Some(canonical_array)
+            }
+        }
     }
 
     fn insert_arrow_array(&self, id: &ArrayIdentifier, array: ArrayRef) {
+        if matches!(self.cache_mode, ArrowCacheMode::NoCache) {
+            return;
+        }
+
         let mut cache = self.value.write().unwrap();
 
         let row_group_cache = cache.entry(id.row_group_id).or_insert_with(HashMap::new);
@@ -94,7 +175,104 @@ impl ArrowArrayCache {
             .entry(id.column_id)
             .or_insert_with(HashMap::new);
 
-        column_cache.insert(id.row_id, array);
+        match &self.cache_mode {
+            ArrowCacheMode::InMemory => {
+                column_cache.insert(id.row_id, CachedEntry::InMemory(array));
+            }
+            ArrowCacheMode::OnDisk => {
+                let path = format!(
+                    "target/arrow-cache/arrow_array_{}_{}_{}.arrow",
+                    id.row_group_id, id.column_id, id.row_id
+                );
+                std::fs::create_dir_all("target/arrow-cache").unwrap();
+                let file = std::fs::File::create(path.clone()).unwrap();
+                let mut writer = std::io::BufWriter::new(file);
+                let schema = Schema::new(vec![Field::new(
+                    "_",
+                    array.data_type().clone(),
+                    array.is_nullable(),
+                )]);
+                let record_batch =
+                    RecordBatch::try_new(Arc::new(schema.clone()), vec![array]).unwrap();
+                let mut arrow_writer = FileWriter::try_new(&mut writer, &schema).unwrap();
+                arrow_writer.write(&record_batch).unwrap();
+                arrow_writer.close().unwrap();
+                column_cache.insert(id.row_id, CachedEntry::OnDisk(path));
+            }
+            ArrowCacheMode::Vortex(compressor) => {
+                let data_type = array.data_type();
+
+                if array.len() < 8192 {
+                    // our batch is too small.
+                    column_cache.insert(id.row_id, CachedEntry::InMemory(array));
+                    return;
+                }
+
+                let vortex_array = match data_type {
+                    DataType::Date32 => {
+                        let primitive_array = array.as_primitive::<ArrowDate32Type>();
+                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
+                    }
+                    DataType::Date64 => {
+                        let primitive_array = array.as_primitive::<ArrowDate64Type>();
+                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
+                    }
+                    DataType::UInt64 => {
+                        let primitive_array = array.as_primitive::<ArrowUInt64Type>();
+                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
+                    }
+                    DataType::UInt32 => {
+                        let primitive_array = array.as_primitive::<ArrowUInt32Type>();
+                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
+                    }
+                    DataType::UInt16 => {
+                        let primitive_array = array.as_primitive::<ArrowUInt16Type>();
+                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
+                    }
+                    DataType::UInt8 => {
+                        let primitive_array = array.as_primitive::<ArrowUInt8Type>();
+                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
+                    }
+                    DataType::Int64 => {
+                        let primitive_array = array.as_primitive::<ArrowInt64Type>();
+                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
+                    }
+                    DataType::Int32 => {
+                        let primitive_array = array.as_primitive::<ArrowInt32Type>();
+                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
+                    }
+                    DataType::Int16 => {
+                        let primitive_array = array.as_primitive::<ArrowInt16Type>();
+                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
+                    }
+                    DataType::Int8 => {
+                        let primitive_array = array.as_primitive::<ArrowInt8Type>();
+                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
+                    }
+                    DataType::Utf8 => {
+                        let string_array = array.as_string::<i32>();
+                        vortex::Array::from_arrow(string_array, array.logical_nulls().is_some())
+                    }
+                    _ => {
+                        unimplemented!("data type {:?} not implemented", data_type);
+                    }
+                };
+
+                match compressor.compress(&vortex_array, None) {
+                    Ok(compressed) => {
+                        column_cache
+                            .insert(id.row_id, CachedEntry::Vortex(compressed.into_array()));
+                    }
+                    Err(_e) => {
+                        column_cache.insert(id.row_id, CachedEntry::InMemory(array));
+                    }
+                }
+            }
+
+            ArrowCacheMode::NoCache => {
+                unreachable!()
+            }
+        }
     }
 }
 
