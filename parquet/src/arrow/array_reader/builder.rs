@@ -17,6 +17,7 @@
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 
 use arrow_array::cast::AsArray;
@@ -26,8 +27,8 @@ use arrow_array::types::{
     UInt16Type as ArrowUInt16Type, UInt32Type as ArrowUInt32Type, UInt64Type as ArrowUInt64Type,
     UInt8Type as ArrowUInt8Type,
 };
-use arrow_array::RecordBatchWriter;
 use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{DictionaryArray, RecordBatchWriter, StringArray, UInt32Array, UInt64Array};
 use arrow_ipc::reader::FileReader;
 use arrow_ipc::writer::FileWriter;
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaBuilder};
@@ -59,17 +60,11 @@ use crate::schema::types::{ColumnDescriptor, ColumnPath, Type};
 
 static ARROW_ARRAY_CACHE: LazyLock<ArrowArrayCache> = LazyLock::new(|| ArrowArrayCache::new());
 
-/// Row offset -> Arrow Array
-type RowMapping = HashMap<usize, CachedEntry>;
+/// Row offset -> (Arrow Array, hit count)
+type RowMapping = HashMap<usize, (CachedEntry, AtomicU64)>;
 
 /// Column offset -> RowMapping
 type ColumnMapping = HashMap<usize, RowMapping>;
-
-enum CachedEntry {
-    InMemory(ArrayRef),
-    Vortex(vortex::Array),
-    OnDisk(String),
-}
 
 #[derive(Debug, Clone)]
 enum ArrowCacheMode {
@@ -80,9 +75,37 @@ enum ArrowCacheMode {
 }
 
 pub struct ArrowArrayCache {
-    /// Row group index -> (Parquet column index -> (row starting index -> arrow array))
-    value: RwLock<HashMap<usize, ColumnMapping>>,
+    /// Vec of RwLocks, where index is the row group index and value is the ColumnMapping
+    value: Vec<RwLock<ColumnMapping>>,
     cache_mode: ArrowCacheMode,
+}
+
+enum CachedEntry {
+    InMemory(ArrayRef),
+    Vortex(Arc<vortex::Array>),
+    OnDisk(String),
+}
+
+impl CachedEntry {
+    fn in_memory(array: ArrayRef) -> (Self, AtomicU64) {
+        (Self::InMemory(array), AtomicU64::new(0))
+    }
+
+    fn on_disk(path: String) -> (Self, AtomicU64) {
+        (Self::OnDisk(path), AtomicU64::new(0))
+    }
+
+    fn vortex(array: Arc<vortex::Array>) -> (Self, AtomicU64) {
+        (Self::Vortex(array), AtomicU64::new(0))
+    }
+
+    fn memory_usage(&self) -> usize {
+        match self {
+            Self::InMemory(array) => array.get_array_memory_size(),
+            Self::OnDisk(_) => 0,
+            Self::Vortex(array) => array.nbytes(),
+        }
+    }
 }
 
 struct ArrayIdentifier {
@@ -100,11 +123,114 @@ impl ArrayIdentifier {
         }
     }
 }
+#[derive(Debug, serde::Serialize)]
+pub struct CacheStatistics {
+    pub row_group_ids: Vec<u64>,
+    pub column_ids: Vec<u64>,
+    pub row_start_ids: Vec<u64>,
+    pub row_counts: Vec<u64>,
+    pub memory_sizes: Vec<u64>,
+    pub cache_types: Vec<CacheType>,
+    pub hit_counts: Vec<u64>,
+}
+
+impl CacheStatistics {
+    pub fn new() -> Self {
+        CacheStatistics {
+            row_group_ids: Vec::new(),
+            column_ids: Vec::new(),
+            row_start_ids: Vec::new(),
+            row_counts: Vec::new(),
+            memory_sizes: Vec::new(),
+            cache_types: Vec::new(),
+            hit_counts: Vec::new(),
+        }
+    }
+
+    pub fn add_entry(
+        &mut self,
+        row_group_id: u64,
+        column_id: u64,
+        row_start_id: u64,
+        row_count: u64,
+        memory_size: u64,
+        cache_type: CacheType,
+        hit_count: u64,
+    ) {
+        self.row_group_ids.push(row_group_id);
+        self.column_ids.push(column_id);
+        self.row_start_ids.push(row_start_id);
+        self.row_counts.push(row_count);
+        self.memory_sizes.push(memory_size);
+        self.cache_types.push(cache_type);
+        self.hit_counts.push(hit_count);
+    }
+
+    pub fn into_record_batch(self) -> RecordBatch {
+        let row_group_ids = Arc::new(UInt64Array::from_iter(self.row_group_ids));
+        let column_ids = Arc::new(UInt64Array::from(self.column_ids));
+        let row_start_ids = Arc::new(UInt64Array::from(self.row_start_ids));
+        let row_counts = Arc::new(UInt64Array::from(self.row_counts));
+        let memory_sizes = Arc::new(UInt64Array::from(self.memory_sizes));
+
+        let cache_type_values: Vec<&str> = self
+            .cache_types
+            .iter()
+            .map(|ct| match ct {
+                CacheType::InMemory => "InMemory",
+                CacheType::OnDisk => "OnDisk",
+                CacheType::Vortex => "Vortex",
+            })
+            .collect();
+        let cache_types = Arc::new(DictionaryArray::new(
+            UInt32Array::from((0..self.cache_types.len() as u32).collect::<Vec<u32>>()),
+            Arc::new(StringArray::from(cache_type_values)),
+        ));
+
+        let hit_counts = Arc::new(UInt64Array::from(self.hit_counts.clone()));
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("row_group_id", DataType::UInt64, false),
+                Field::new("column_id", DataType::UInt64, false),
+                Field::new("row_start_id", DataType::UInt64, false),
+                Field::new("row_count", DataType::UInt64, false),
+                Field::new("memory_size", DataType::UInt64, false),
+                Field::new(
+                    "cache_type",
+                    DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                    false,
+                ),
+                Field::new("hit_count", DataType::UInt64, false),
+            ])),
+            vec![
+                row_group_ids,
+                column_ids,
+                row_start_ids,
+                row_counts,
+                memory_sizes,
+                cache_types,
+                hit_counts,
+            ],
+        )
+        .unwrap()
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub enum CacheType {
+    InMemory,
+    OnDisk,
+    Vortex,
+}
 
 impl ArrowArrayCache {
     fn new() -> Self {
-        Self {
-            value: RwLock::new(HashMap::new()),
+        const MAX_ROW_GROUPS: usize = 512;
+        ArrowArrayCache {
+            value: (0..MAX_ROW_GROUPS)
+                .map(|_| RwLock::new(ColumnMapping::new()))
+                .collect(),
             cache_mode: std::env::var("ARROW_CACHE_MODE").map_or(ArrowCacheMode::NoCache, |v| {
                 match v.to_lowercase().as_str() {
                     "disk" => ArrowCacheMode::OnDisk,
@@ -127,8 +253,15 @@ impl ArrowArrayCache {
         }
     }
 
-    fn get() -> &'static ArrowArrayCache {
+    pub fn get() -> &'static ArrowArrayCache {
         &ARROW_ARRAY_CACHE
+    }
+
+    pub fn reset(&self) {
+        for row_group in self.value.iter() {
+            let mut row_group = row_group.write().unwrap();
+            row_group.clear();
+        }
     }
 
     fn get_arrow_array(&self, id: &ArrayIdentifier) -> Option<ArrayRef> {
@@ -136,12 +269,11 @@ impl ArrowArrayCache {
             return None;
         }
 
-        let cache = self.value.read().unwrap();
+        let cache = &self.value[id.row_group_id].read().unwrap();
 
-        let row_group_cache = cache.get(&id.row_group_id)?;
-        let column_cache = row_group_cache.get(&id.column_id)?;
-
-        let cached = column_cache.get(&id.row_id)?;
+        let column_cache = cache.get(&id.column_id)?;
+        let (cached, hit_count) = column_cache.get(&id.row_id)?;
+        hit_count.fetch_add(1, Ordering::Relaxed);
         match cached {
             CachedEntry::InMemory(array) => Some(array.clone()),
             CachedEntry::OnDisk(path) => {
@@ -152,12 +284,9 @@ impl ArrowArrayCache {
                 Some(batch.column(0).clone())
             }
             CachedEntry::Vortex(array) => {
-                let canonical_array = array
-                    .clone()
-                    .into_canonical()
-                    .unwrap()
-                    .into_arrow()
-                    .unwrap();
+                let array: vortex::Array = (**array).clone();
+                let array = array.into_canonical().unwrap();
+                let canonical_array = array.into_arrow().unwrap();
                 Some(canonical_array)
             }
         }
@@ -168,16 +297,14 @@ impl ArrowArrayCache {
             return;
         }
 
-        let mut cache = self.value.write().unwrap();
+        let mut cache = self.value[id.row_group_id].write().unwrap();
 
-        let row_group_cache = cache.entry(id.row_group_id).or_insert_with(HashMap::new);
-        let column_cache = row_group_cache
-            .entry(id.column_id)
-            .or_insert_with(HashMap::new);
+        let column_cache = cache.entry(id.column_id).or_insert_with(HashMap::new);
 
         match &self.cache_mode {
             ArrowCacheMode::InMemory => {
-                column_cache.insert(id.row_id, CachedEntry::InMemory(array));
+                let old = column_cache.insert(id.row_id, CachedEntry::in_memory(array));
+                assert!(old.is_none());
             }
             ArrowCacheMode::OnDisk => {
                 let path = format!(
@@ -197,14 +324,14 @@ impl ArrowArrayCache {
                 let mut arrow_writer = FileWriter::try_new(&mut writer, &schema).unwrap();
                 arrow_writer.write(&record_batch).unwrap();
                 arrow_writer.close().unwrap();
-                column_cache.insert(id.row_id, CachedEntry::OnDisk(path));
+                column_cache.insert(id.row_id, CachedEntry::on_disk(path));
             }
             ArrowCacheMode::Vortex(compressor) => {
                 let data_type = array.data_type();
 
                 if array.len() < 8192 {
                     // our batch is too small.
-                    column_cache.insert(id.row_id, CachedEntry::InMemory(array));
+                    column_cache.insert(id.row_id, CachedEntry::in_memory(array));
                     return;
                 }
 
@@ -260,11 +387,13 @@ impl ArrowArrayCache {
 
                 match compressor.compress(&vortex_array, None) {
                     Ok(compressed) => {
-                        column_cache
-                            .insert(id.row_id, CachedEntry::Vortex(compressed.into_array()));
+                        column_cache.insert(
+                            id.row_id,
+                            CachedEntry::vortex(Arc::new(compressed.into_array())),
+                        );
                     }
                     Err(_e) => {
-                        column_cache.insert(id.row_id, CachedEntry::InMemory(array));
+                        column_cache.insert(id.row_id, CachedEntry::in_memory(array));
                     }
                 }
             }
@@ -273,6 +402,43 @@ impl ArrowArrayCache {
                 unreachable!()
             }
         }
+    }
+
+    pub fn stats(&self) -> CacheStatistics {
+        let mut stats = CacheStatistics::new();
+
+        for (row_group_id, row_group_lock) in self.value.iter().enumerate() {
+            let row_group = row_group_lock.read().unwrap();
+
+            for (column_id, row_mapping) in row_group.iter() {
+                for (row_start_id, (cached_entry, hit_count)) in row_mapping {
+                    let cache_type = match cached_entry {
+                        CachedEntry::InMemory(_) => CacheType::InMemory,
+                        CachedEntry::OnDisk(_) => CacheType::OnDisk,
+                        CachedEntry::Vortex(_) => CacheType::Vortex,
+                    };
+
+                    let memory_size = cached_entry.memory_usage();
+                    let row_count = match cached_entry {
+                        CachedEntry::InMemory(array) => array.len(),
+                        CachedEntry::OnDisk(_) => 0, // We don't know the row count for on-disk entries
+                        CachedEntry::Vortex(array) => array.len(),
+                    };
+
+                    stats.add_entry(
+                        row_group_id as u64,
+                        *column_id as u64,
+                        *row_start_id as u64,
+                        row_count as u64,
+                        memory_size as u64,
+                        cache_type,
+                        hit_count.load(Ordering::Relaxed),
+                    );
+                }
+            }
+        }
+
+        stats
     }
 }
 
@@ -309,11 +475,13 @@ impl ArrayReader for CachedArrayReader {
         let batch_id = ArrayIdentifier::new(self.row_group_id, self.column_id, self.current_row_id);
         if let Some(cached_array) = ArrowArrayCache::get().get_arrow_array(&batch_id) {
             let cached_len = cached_array.len();
+            assert!(self.current_cached.is_none());
             self.current_cached = Some(cached_array);
-            self.skip_records(cached_len)?;
+            let skipped = self.inner.skip_records(cached_len).unwrap();
+            assert!(skipped == cached_len);
             return Ok(cached_len);
         }
-        let records_read = self.inner.read_records(batch_size)?;
+        let records_read = self.inner.read_records(batch_size).unwrap();
         Ok(records_read)
     }
 
@@ -323,18 +491,22 @@ impl ArrayReader for CachedArrayReader {
             return Ok(cached_array);
         }
 
-        let records = self.inner.consume_batch()?;
+        let records = self.inner.consume_batch().unwrap();
 
-        let batch_id = ArrayIdentifier::new(self.row_group_id, self.column_id, self.current_row_id);
-        ArrowArrayCache::get().insert_arrow_array(&batch_id, records.clone());
-        self.current_row_id += records.len();
+        if records.len() > 0 {
+            let batch_id =
+                ArrayIdentifier::new(self.row_group_id, self.column_id, self.current_row_id);
+            ArrowArrayCache::get().insert_arrow_array(&batch_id, records.clone());
+            self.current_row_id += records.len();
+        }
+
         Ok(records)
     }
 
     fn skip_records(&mut self, num_records: usize) -> Result<usize> {
-        self.inner.skip_records(num_records)?;
-        self.current_row_id += num_records;
-        Ok(num_records)
+        let skipped = self.inner.skip_records(num_records).unwrap();
+        self.current_row_id += skipped;
+        Ok(skipped)
     }
 
     fn get_def_levels(&self) -> Option<&[i16]> {

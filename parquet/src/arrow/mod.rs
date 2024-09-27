@@ -116,6 +116,7 @@ pub use self::async_writer::AsyncArrowWriter;
 use crate::schema::types::SchemaDescriptor;
 use arrow_schema::{FieldRef, Schema};
 
+pub use self::array_reader::builder;
 pub use self::schema::{
     arrow_to_parquet_schema, parquet_to_arrow_field_levels, parquet_to_arrow_schema,
     parquet_to_arrow_schema_by_columns, FieldLevels,
