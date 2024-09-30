@@ -75,7 +75,7 @@
 //! # }
 //! ```
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Formatter;
 use std::io::SeekFrom;
 use std::ops::Range;
@@ -97,6 +97,7 @@ use crate::arrow::arrow_reader::{
     apply_range, evaluate_predicate, selects_any, ArrowReaderBuilder, ArrowReaderMetadata,
     ArrowReaderOptions, ParquetRecordBatchReader, RowFilter, RowSelection,
 };
+use crate::arrow::builder::{ArrayIdentifier, ArrowArrayCache};
 use crate::arrow::ProjectionMask;
 
 use crate::bloom_filter::{
@@ -466,6 +467,7 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
             schema,
             reader: Some(reader),
             state: StreamState::Init,
+            cached_selection: CachedSelection::default(),
         })
     }
 }
@@ -594,6 +596,7 @@ where
 }
 
 enum StreamState<T> {
+    PopCache((usize, Vec<usize>)),
     /// At the start of a new row group, or the end of the parquet stream
     Init,
     /// Decoding a batch
@@ -607,10 +610,26 @@ enum StreamState<T> {
 impl<T> std::fmt::Debug for StreamState<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            StreamState::PopCache(_) => write!(f, "StreamState::PopCache"),
             StreamState::Init => write!(f, "StreamState::Init"),
             StreamState::Decoding(_) => write!(f, "StreamState::Decoding"),
             StreamState::Reading(_) => write!(f, "StreamState::Reading"),
             StreamState::Error => write!(f, "StreamState::Error"),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct CachedSelection {
+    selections: HashMap<usize, Vec<usize>>, // row_group_idx -> row_ids
+    column_idx: Vec<usize>,                 // leaf&root column indices
+}
+
+impl CachedSelection {
+    pub fn new(selections: HashMap<usize, Vec<usize>>, column_idx: Vec<usize>) -> Self {
+        Self {
+            selections,
+            column_idx,
         }
     }
 }
@@ -634,6 +653,8 @@ pub struct ParquetRecordBatchStream<T> {
     reader: Option<ReaderFactory<T>>,
 
     state: StreamState<T>,
+
+    cached_selection: CachedSelection,
 }
 
 impl<T> std::fmt::Debug for ParquetRecordBatchStream<T> {
@@ -656,6 +677,10 @@ impl<T> ParquetRecordBatchStream<T> {
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
     }
+
+    pub fn set_cached_selection(&mut self, cached_selection: CachedSelection) {
+        self.cached_selection = cached_selection;
+    }
 }
 
 impl<T> Stream for ParquetRecordBatchStream<T>
@@ -665,8 +690,32 @@ where
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let schema = self.schema.clone();
+        let column_idx = self.cached_selection.column_idx.clone();
         loop {
             match &mut self.state {
+                StreamState::PopCache((row_group_index, selection)) => {
+                    match selection.pop() {
+                        Some(row_id) => {
+                            let arrays = column_idx
+                                .iter()
+                                .map(|idx| {
+                                    let id = ArrayIdentifier::new(*row_group_index, *idx, row_id);
+                                    let array = ArrowArrayCache::get()
+                                        .get_arrow_array(&id)
+                                        .expect("array not found in cache");
+                                    array
+                                })
+                                .collect();
+                            let batch = RecordBatch::try_new(schema, arrays)?;
+                            return Poll::Ready(Some(Ok(batch)));
+                        }
+                        None => {
+                            self.state = StreamState::Init;
+                            continue;
+                        }
+                    };
+                }
                 StreamState::Decoding(batch_reader) => match batch_reader.next() {
                     Some(Ok(batch)) => {
                         return Poll::Ready(Some(Ok(batch)));
@@ -678,6 +727,12 @@ where
                     None => self.state = StreamState::Init,
                 },
                 StreamState::Init => {
+                    if let Some((&key, _)) = self.cached_selection.selections.iter().next() {
+                        let v = self.cached_selection.selections.remove(&key).unwrap();
+                        self.state = StreamState::PopCache((key, v));
+                        continue;
+                    }
+
                     let row_group_idx = match self.row_groups.pop_front() {
                         Some(idx) => idx,
                         None => return Poll::Ready(None),
