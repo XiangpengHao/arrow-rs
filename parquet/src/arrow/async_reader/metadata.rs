@@ -17,10 +17,10 @@
 
 use crate::arrow::async_reader::AsyncFileReader;
 use crate::errors::{ParquetError, Result};
-use crate::file::footer::{decode_footer, decode_metadata};
-use crate::file::metadata::ParquetMetaData;
+use crate::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use crate::file::page_index::index::Index;
 use crate::file::page_index::index_reader::{acc_range, decode_column_index, decode_offset_index};
+use crate::file::FOOTER_SIZE;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -29,6 +29,7 @@ use std::ops::Range;
 
 /// A data source that can be used with [`MetadataLoader`] to load [`ParquetMetaData`]
 pub trait MetadataFetch {
+    /// Fetches a range of bytes asynchronously
     fn fetch(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Bytes>>;
 }
 
@@ -52,8 +53,9 @@ impl<F: MetadataFetch> MetadataLoader<F> {
     /// Create a new [`MetadataLoader`] by reading the footer information
     ///
     /// See [`fetch_parquet_metadata`] for the meaning of the individual parameters
+    #[deprecated(since = "53.1.0", note = "Use ParquetMetaDataReader")]
     pub async fn load(mut fetch: F, file_size: usize, prefetch: Option<usize>) -> Result<Self> {
-        if file_size < 8 {
+        if file_size < FOOTER_SIZE {
             return Err(ParquetError::EOF(format!(
                 "file size of {file_size} is less than footer"
             )));
@@ -62,20 +64,22 @@ impl<F: MetadataFetch> MetadataLoader<F> {
         // If a size hint is provided, read more than the minimum size
         // to try and avoid a second fetch.
         let footer_start = if let Some(size_hint) = prefetch {
+            // check for hint smaller than footer
+            let size_hint = std::cmp::max(size_hint, FOOTER_SIZE);
             file_size.saturating_sub(size_hint)
         } else {
-            file_size - 8
+            file_size - FOOTER_SIZE
         };
 
         let suffix = fetch.fetch(footer_start..file_size).await?;
         let suffix_len = suffix.len();
 
-        let mut footer = [0; 8];
-        footer.copy_from_slice(&suffix[suffix_len - 8..suffix_len]);
+        let mut footer = [0; FOOTER_SIZE];
+        footer.copy_from_slice(&suffix[suffix_len - FOOTER_SIZE..suffix_len]);
 
-        let length = decode_footer(&footer)?;
+        let length = ParquetMetaDataReader::decode_footer(&footer)?;
 
-        if file_size < length + 8 {
+        if file_size < length + FOOTER_SIZE {
             return Err(ParquetError::EOF(format!(
                 "file size of {} is less than footer + metadata {}",
                 file_size,
@@ -84,16 +88,16 @@ impl<F: MetadataFetch> MetadataLoader<F> {
         }
 
         // Did not fetch the entire file metadata in the initial read, need to make a second request
-        let (metadata, remainder) = if length > suffix_len - 8 {
-            let metadata_start = file_size - length - 8;
-            let meta = fetch.fetch(metadata_start..file_size - 8).await?;
-            (decode_metadata(&meta)?, None)
+        let (metadata, remainder) = if length > suffix_len - FOOTER_SIZE {
+            let metadata_start = file_size - length - FOOTER_SIZE;
+            let meta = fetch.fetch(metadata_start..file_size - FOOTER_SIZE).await?;
+            (ParquetMetaDataReader::decode_metadata(&meta)?, None)
         } else {
-            let metadata_start = file_size - length - 8 - footer_start;
+            let metadata_start = file_size - length - FOOTER_SIZE - footer_start;
 
-            let slice = &suffix[metadata_start..suffix_len - 8];
+            let slice = &suffix[metadata_start..suffix_len - FOOTER_SIZE];
             (
-                decode_metadata(slice)?,
+                ParquetMetaDataReader::decode_metadata(slice)?,
                 Some((footer_start, suffix.slice(..metadata_start))),
             )
         };
@@ -106,6 +110,7 @@ impl<F: MetadataFetch> MetadataLoader<F> {
     }
 
     /// Create a new [`MetadataLoader`] from an existing [`ParquetMetaData`]
+    #[deprecated(since = "53.1.0", note = "Use ParquetMetaDataReader")]
     pub fn new(fetch: F, metadata: ParquetMetaData) -> Self {
         Self {
             fetch,
@@ -118,6 +123,7 @@ impl<F: MetadataFetch> MetadataLoader<F> {
     ///
     /// * `column_index`: if true will load column index
     /// * `offset_index`: if true will load offset index
+    #[deprecated(since = "53.1.0", note = "Use ParquetMetaDataReader")]
     pub async fn load_page_index(&mut self, column_index: bool, offset_index: bool) -> Result<()> {
         if !column_index && !offset_index {
             return Ok(());
@@ -224,6 +230,7 @@ where
 /// in the first request, instead of 8, and only issue further requests
 /// if additional bytes are needed. Providing a `prefetch` hint can therefore
 /// significantly reduce the number of `fetch` requests, and consequently latency
+#[deprecated(since = "53.1.0", note = "Use ParquetMetaDataReader")]
 pub async fn fetch_parquet_metadata<F, Fut>(
     fetch: F,
     file_size: usize,
@@ -234,10 +241,14 @@ where
     Fut: Future<Output = Result<Bytes>> + Send,
 {
     let fetch = MetadataFetchFn(fetch);
-    let loader = MetadataLoader::load(fetch, file_size, prefetch).await?;
-    Ok(loader.finish())
+    ParquetMetaDataReader::new()
+        .with_prefetch_hint(prefetch)
+        .load_and_finish(fetch, file_size)
+        .await
 }
 
+// these tests are all replicated in parquet::file::metadata::reader
+#[allow(deprecated)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +281,14 @@ mod tests {
         };
 
         let actual = fetch_parquet_metadata(&mut fetch, len, None).await.unwrap();
+        assert_eq!(actual.file_metadata().schema(), expected);
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 2);
+
+        // Metadata hint too small - below footer size
+        fetch_count.store(0, Ordering::SeqCst);
+        let actual = fetch_parquet_metadata(&mut fetch, len, Some(7))
+            .await
+            .unwrap();
         assert_eq!(actual.file_metadata().schema(), expected);
         assert_eq!(fetch_count.load(Ordering::SeqCst), 2);
 
