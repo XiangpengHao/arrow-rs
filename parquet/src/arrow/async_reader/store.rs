@@ -53,6 +53,7 @@ use crate::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 #[derive(Clone, Debug)]
 pub struct ParquetObjectReader {
     store: Arc<dyn ObjectStore>,
+    /// ObjectMeta
     pub meta: ObjectMeta,
     metadata_size_hint: Option<usize>,
     preload_column_index: bool,

@@ -29,6 +29,7 @@ use crate::column::page::PageIterator;
 use crate::column::reader::decoder::ColumnValueDecoder;
 use crate::file::reader::{FilePageIterator, FileReader};
 
+/// Array reader builder
 pub mod builder;
 mod byte_array;
 mod byte_array_dictionary;
