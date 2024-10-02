@@ -617,6 +617,7 @@ impl<T> std::fmt::Debug for StreamState<T> {
     }
 }
 
+/// CachedSelection is used to cache the selection of rows and columns.
 #[derive(Default)]
 pub struct CachedSelection {
     selections: HashMap<usize, Vec<usize>>, // row_group_idx -> row_ids
@@ -624,6 +625,7 @@ pub struct CachedSelection {
 }
 
 impl CachedSelection {
+    /// Create a new CachedSelection.
     pub fn new(selections: HashMap<usize, Vec<usize>>, column_idx: Vec<usize>) -> Self {
         Self {
             selections,
@@ -676,6 +678,7 @@ impl<T> ParquetRecordBatchStream<T> {
         &self.schema
     }
 
+    /// Set the cached selection.
     pub fn set_cached_selection(&mut self, cached_selection: CachedSelection) {
         self.cached_selection = cached_selection;
     }
