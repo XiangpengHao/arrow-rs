@@ -38,7 +38,6 @@ use vortex::IntoCanonical;
 use vortex_sampling_compressor::compressors::alp::ALPCompressor;
 use vortex_sampling_compressor::compressors::bitpacked::BitPackedCompressor;
 use vortex_sampling_compressor::compressors::delta::DeltaCompressor;
-use vortex_sampling_compressor::compressors::dict::DictCompressor;
 use vortex_sampling_compressor::compressors::fsst::FSSTCompressor;
 use vortex_sampling_compressor::compressors::r#for::FoRCompressor;
 use vortex_sampling_compressor::compressors::CompressorRef;
@@ -144,7 +143,7 @@ impl ArrayIdentifier {
     }
 }
 #[derive(Debug, serde::Serialize)]
-pub struct CacheStatistics {
+pub struct ArrowCacheStatistics {
     pub row_group_ids: Vec<u64>,
     pub column_ids: Vec<u64>,
     pub row_start_ids: Vec<u64>,
@@ -154,9 +153,9 @@ pub struct CacheStatistics {
     pub hit_counts: Vec<u64>,
 }
 
-impl CacheStatistics {
+impl ArrowCacheStatistics {
     pub fn new() -> Self {
-        CacheStatistics {
+        ArrowCacheStatistics {
             row_group_ids: Vec::new(),
             column_ids: Vec::new(),
             row_start_ids: Vec::new(),
@@ -184,6 +183,10 @@ impl CacheStatistics {
         self.memory_sizes.push(memory_size);
         self.cache_types.push(cache_type);
         self.hit_counts.push(hit_count);
+    }
+
+    pub fn memory_usage(&self) -> usize {
+        self.memory_sizes.iter().sum::<u64>() as usize
     }
 
     pub fn into_record_batch(self) -> RecordBatch {
@@ -267,7 +270,7 @@ impl ArrowArrayCache {
                             &ALPCompressor as CompressorRef,
                             &BitPackedCompressor,
                             &DeltaCompressor,
-                            &DictCompressor,
+                            // &DictCompressor,
                             &FoRCompressor,
                             &FSSTCompressor,
                         ]),
@@ -451,8 +454,8 @@ impl ArrowArrayCache {
         }
     }
 
-    pub fn stats(&self) -> CacheStatistics {
-        let mut stats = CacheStatistics::new();
+    pub fn stats(&self) -> ArrowCacheStatistics {
+        let mut stats = ArrowCacheStatistics::new();
 
         for (row_group_id, row_group_lock) in self.value.iter().enumerate() {
             let row_group = row_group_lock.read().unwrap();
