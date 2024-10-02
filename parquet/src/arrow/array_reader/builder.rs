@@ -127,6 +127,7 @@ impl CachedValue {
     }
 }
 
+/// ArrayIdentifier is used to identify an array in the cache.
 pub struct ArrayIdentifier {
     row_group_id: usize,
     column_id: usize,
@@ -134,6 +135,7 @@ pub struct ArrayIdentifier {
 }
 
 impl ArrayIdentifier {
+    /// Create a new ArrayIdentifier.
     pub fn new(row_group_id: usize, column_id: usize, row_id: usize) -> Self {
         Self {
             row_group_id,
@@ -142,18 +144,28 @@ impl ArrayIdentifier {
         }
     }
 }
+
+/// ArrowCacheStatistics is used to collect statistics about the arrow array cache.
 #[derive(Debug, serde::Serialize)]
 pub struct ArrowCacheStatistics {
+    /// Row group ids
     pub row_group_ids: Vec<u64>,
+    /// Column ids
     pub column_ids: Vec<u64>,
+    /// Row start ids
     pub row_start_ids: Vec<u64>,
+    /// Row counts
     pub row_counts: Vec<u64>,
+    /// Memory sizes
     pub memory_sizes: Vec<u64>,
+    /// Cache types
     pub cache_types: Vec<CacheType>,
+    /// Hit counts
     pub hit_counts: Vec<u64>,
 }
 
 impl ArrowCacheStatistics {
+    /// Create a new ArrowCacheStatistics.
     pub fn new() -> Self {
         ArrowCacheStatistics {
             row_group_ids: Vec::new(),
@@ -166,6 +178,7 @@ impl ArrowCacheStatistics {
         }
     }
 
+    /// Add an entry to the statistics.
     pub fn add_entry(
         &mut self,
         row_group_id: u64,
@@ -185,10 +198,12 @@ impl ArrowCacheStatistics {
         self.hit_counts.push(hit_count);
     }
 
+    /// Get the total memory usage of the cache.
     pub fn memory_usage(&self) -> usize {
         self.memory_sizes.iter().sum::<u64>() as usize
     }
 
+    /// Convert the statistics to a record batch.
     pub fn into_record_batch(self) -> RecordBatch {
         let row_group_ids = Arc::new(UInt64Array::from_iter(self.row_group_ids));
         let column_ids = Arc::new(UInt64Array::from(self.column_ids));
@@ -240,13 +255,18 @@ impl ArrowCacheStatistics {
     }
 }
 
+/// CacheType is used to identify the type of cache.
 #[derive(Debug, serde::Serialize)]
 pub enum CacheType {
+    /// InMemory cache
     InMemory,
+    /// OnDisk cache
     OnDisk,
+    /// Vortex cache
     Vortex,
 }
 
+/// ArrowArrayCache is used to cache arrow arrays in memory, on disk, or in a vortex.
 pub struct ArrowArrayCache {
     /// Vec of RwLocks, where index is the row group index and value is the ColumnMapping
     value: Vec<RwLock<ColumnMapping>>,
@@ -254,6 +274,7 @@ pub struct ArrowArrayCache {
 }
 
 impl ArrowArrayCache {
+    /// Create a new ArrowArrayCache.
     fn new() -> Self {
         const MAX_ROW_GROUPS: usize = 512;
         ArrowArrayCache {
@@ -282,10 +303,12 @@ impl ArrowArrayCache {
         }
     }
 
+    /// Get the static ArrowArrayCache.
     pub fn get() -> &'static ArrowArrayCache {
         &ARROW_ARRAY_CACHE
     }
 
+    /// Reset the cache.
     pub fn reset(&self) {
         for row_group in self.value.iter() {
             let mut row_group = row_group.write().unwrap();
@@ -313,6 +336,7 @@ impl ArrowArrayCache {
         Some(result_ranges)
     }
 
+    /// Get an arrow array from the cache.
     pub fn get_arrow_array(&self, id: &ArrayIdentifier) -> Option<ArrayRef> {
         if matches!(self.cache_mode, ArrowCacheMode::NoCache) {
             return None;
@@ -341,6 +365,7 @@ impl ArrowArrayCache {
         }
     }
 
+    /// Insert an arrow array into the cache.
     fn insert_arrow_array(&self, id: &ArrayIdentifier, array: ArrayRef) {
         if matches!(self.cache_mode, ArrowCacheMode::NoCache) {
             return;
@@ -454,6 +479,7 @@ impl ArrowArrayCache {
         }
     }
 
+    /// Collect statistics about the cache.
     pub fn stats(&self) -> ArrowCacheStatistics {
         let mut stats = ArrowCacheStatistics::new();
 
@@ -568,6 +594,7 @@ impl ArrayReader for CachedArrayReader {
     }
 }
 
+/// Create array reader from parquet schema, projection mask, and parquet file reader.
 pub fn build_cached_array_reader(
     field: Option<&ParquetField>,
     mask: &ProjectionMask,
