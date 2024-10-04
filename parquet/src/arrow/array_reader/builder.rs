@@ -523,7 +523,12 @@ struct CachedArrayReader {
     current_row_id: usize,
     column_id: usize,
     row_group_id: usize,
-    current_cached: Option<ArrayRef>,
+    current_cached: Vec<BufferValueType>,
+}
+
+enum BufferValueType {
+    Cached(ArrayRef),
+    Parquet,
 }
 
 impl CachedArrayReader {
@@ -533,7 +538,7 @@ impl CachedArrayReader {
             current_row_id: 0,
             row_group_id,
             column_id,
-            current_cached: None,
+            current_cached: vec![],
         }
     }
 }
@@ -547,36 +552,60 @@ impl ArrayReader for CachedArrayReader {
         self.inner.get_data_type()
     }
 
-    fn read_records(&mut self, batch_size: usize) -> Result<usize> {
+    fn read_records(&mut self, request_size: usize) -> Result<usize> {
         let batch_id = ArrayIdentifier::new(self.row_group_id, self.column_id, self.current_row_id);
-        if let Some(cached_array) = ArrowArrayCache::get().get_arrow_array(&batch_id) {
-            let cached_len = cached_array.len();
-            assert!(self.current_cached.is_none());
-            self.current_cached = Some(cached_array);
-            let skipped = self.inner.skip_records(cached_len).unwrap();
-            assert!(skipped == cached_len);
-            return Ok(cached_len);
+        if let Some(mut cached_array) = ArrowArrayCache::get().get_arrow_array(&batch_id) {
+            let cached_size = cached_array.len();
+            if cached_size > request_size {
+                // this means we have row selection, so we need to split the cached array
+                cached_array = cached_array.slice(0, request_size);
+            }
+            let to_skip = cached_array.len();
+            self.current_cached
+                .push(BufferValueType::Cached(cached_array));
+
+            let skipped = self.inner.skip_records(to_skip).unwrap();
+            assert_eq!(skipped, to_skip);
+            self.current_row_id += to_skip;
+            return Ok(to_skip);
+        } else {
+            let records_read = self.inner.read_records(request_size).unwrap();
+            self.current_cached.push(BufferValueType::Parquet);
+            self.current_row_id += records_read;
+            Ok(records_read)
         }
-        let records_read = self.inner.read_records(batch_size).unwrap();
-        Ok(records_read)
     }
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {
-        if let Some(cached_array) = self.current_cached.take() {
-            self.current_row_id += cached_array.len();
-            return Ok(cached_array);
+        let mut final_array = vec![];
+        let mut parquet_count = 0;
+        for value in self.current_cached.iter() {
+            match value {
+                BufferValueType::Cached(array) => {
+                    final_array.push(array.as_ref());
+                }
+                BufferValueType::Parquet => parquet_count += 1,
+            }
         }
 
-        let records = self.inner.consume_batch().unwrap();
+        let parquet_records = self.inner.consume_batch().unwrap();
+        final_array.push(parquet_records.as_ref());
 
-        if records.len() > 0 {
-            let batch_id =
-                ArrayIdentifier::new(self.row_group_id, self.column_id, self.current_row_id);
-            ArrowArrayCache::get().insert_arrow_array(&batch_id, records.clone());
-            self.current_row_id += records.len();
+        if parquet_records.len() > 0 && final_array.len() == 1 && parquet_count == 1 {
+            // no cached records
+            // only one parquet read
+            let batch_id = ArrayIdentifier::new(
+                self.row_group_id,
+                self.column_id,
+                self.current_row_id - parquet_records.len(),
+            );
+            ArrowArrayCache::get().insert_arrow_array(&batch_id, parquet_records.clone());
         }
 
-        Ok(records)
+        let final_array = arrow_select::concat::concat(&final_array).unwrap();
+        self.current_cached.clear();
+
+        Ok(final_array)
     }
 
     fn skip_records(&mut self, num_records: usize) -> Result<usize> {

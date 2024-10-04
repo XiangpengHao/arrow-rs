@@ -92,7 +92,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Fields, Schema, SchemaRef};
 
-use crate::arrow::array_reader::{build_array_reader, RowGroups};
+use crate::arrow::array_reader::RowGroups;
 use crate::arrow::arrow_reader::{
     apply_range, evaluate_predicate, selects_any, ArrowReaderBuilder, ArrowReaderMetadata,
     ArrowReaderOptions, ParquetRecordBatchReader, RowFilter, RowSelection,
@@ -533,8 +533,12 @@ where
                     .fetch(&mut self.input, predicate_projection, selection.as_ref())
                     .await?;
 
-                let array_reader =
-                    build_array_reader(self.fields.as_deref(), predicate_projection, &row_group)?;
+                let array_reader = build_cached_array_reader(
+                    self.fields.as_deref(),
+                    predicate_projection,
+                    &row_group,
+                    row_group_idx,
+                )?;
 
                 selection = Some(evaluate_predicate(
                     batch_size,
