@@ -748,7 +748,31 @@ impl CacheRecordBatchReader {
             &schema,
             &column_idx,
         );
-        Self { record_batches }
+
+        let mut coalesced_batches = vec![];
+        let mut accumulated = (0, 0); // (num_rows, batch_idx)
+        for i in 0..record_batches.len() {
+            let batch = &record_batches[i];
+            let len = batch.num_rows();
+            if accumulated.0 + len <= 8192 {
+                accumulated.0 += len;
+            } else {
+                let prev_batches = &record_batches[accumulated.1..i];
+                let new_batch =
+                    arrow_select::concat::concat_batches(&schema, prev_batches).unwrap();
+                coalesced_batches.push(new_batch);
+                accumulated = (len, i);
+            }
+        }
+        if accumulated.0 > 0 {
+            let prev_batches = &record_batches[accumulated.1..];
+            let new_batch = arrow_select::concat::concat_batches(&schema, prev_batches).unwrap();
+            coalesced_batches.push(new_batch);
+        }
+
+        Self {
+            record_batches: coalesced_batches,
+        }
     }
 
     pub fn next(&mut self) -> Option<RecordBatch> {
