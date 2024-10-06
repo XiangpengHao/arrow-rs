@@ -360,19 +360,20 @@ impl ArrowArrayCache {
                 let current_row_id = row_id + current_selected;
                 let batch_row_id = current_row_id / 8192 * 8192; // TODO: batch size may not be 8192
                 let batch_row_count = 8192 - (current_row_id % 8192);
+                let offset = current_row_id.saturating_sub(batch_row_id);
+                let want_to_select =
+                    std::cmp::min(batch_row_count, row_selector.row_count - current_selected);
 
                 let mut columns = Vec::new();
                 for &column_id in parquet_column_ids {
                     let id = ArrayIdentifier::new(row_group_id, column_id, batch_row_id);
-                    let mut array = self.get_arrow_array(&id).unwrap();
-                    if batch_row_id < current_row_id {
-                        array = array.slice(current_row_id - batch_row_id, batch_row_count);
-                    }
+                    let array = self.get_arrow_array(&id).unwrap();
                     columns.push(array);
                 }
 
                 assert!(columns.len() == parquet_column_ids.len());
                 let record_batch = RecordBatch::try_new(Arc::new(schema.clone()), columns).unwrap();
+                let record_batch = record_batch.slice(offset, want_to_select);
                 let actual_row_count = record_batch.num_rows(); // might be less than batch_row_count if we reach the end of the row group.
                 record_batches.push(record_batch);
 
@@ -470,9 +471,19 @@ impl ArrowArrayCache {
         }
     }
 
+    fn id_exists(&self, id: &ArrayIdentifier) -> bool {
+        let cache = &self.value[id.row_group_id].read().unwrap();
+        cache.contains_key(&id.column_id)
+            && cache.get(&id.column_id).unwrap().contains_key(&id.row_id)
+    }
+
     /// Insert an arrow array into the cache.
     fn insert_arrow_array(&self, id: &ArrayIdentifier, array: ArrayRef) {
         if matches!(self.cache_mode, ArrowCacheMode::NoCache) {
+            return;
+        }
+
+        if self.id_exists(id) {
             return;
         }
 
@@ -689,27 +700,32 @@ impl ArrayReader for CachedArrayReader {
     }
 
     fn read_records(&mut self, request_size: usize) -> Result<usize> {
-        let batch_id = ArrayIdentifier::new(self.row_group_id, self.column_id, self.current_row_id);
+        let row_batch_id = self.current_row_id / 8192 * 8192;
+        let offset = self.current_row_id - row_batch_id;
+        let batch_id = ArrayIdentifier::new(self.row_group_id, self.column_id, row_batch_id);
         if let Some(mut cached_array) = ArrowArrayCache::get().get_arrow_array(&batch_id) {
             let cached_size = cached_array.len();
-            if cached_size > request_size {
-                // this means we have row selection, so we need to split the cached array
-                cached_array = cached_array.slice(0, request_size);
-            }
-            let to_skip = cached_array.len();
-            self.current_cached
-                .push(BufferValueType::Cached(cached_array));
+            if (self.current_row_id + request_size) <= (row_batch_id + cached_size) {
+                if cached_size > request_size {
+                    // this means we have row selection, so we need to split the cached array
+                    cached_array = cached_array.slice(offset, request_size);
+                }
 
-            let skipped = self.inner.skip_records(to_skip).unwrap();
-            assert_eq!(skipped, to_skip);
-            self.current_row_id += to_skip;
-            return Ok(to_skip);
-        } else {
-            let records_read = self.inner.read_records(request_size).unwrap();
-            self.current_cached.push(BufferValueType::Parquet);
-            self.current_row_id += records_read;
-            Ok(records_read)
+                let to_skip = cached_array.len();
+                self.current_cached
+                    .push(BufferValueType::Cached(cached_array));
+
+                let skipped = self.inner.skip_records(to_skip).unwrap();
+                assert_eq!(skipped, to_skip);
+                self.current_row_id += to_skip;
+                return Ok(to_skip);
+            }
         }
+
+        let records_read = self.inner.read_records(request_size).unwrap();
+        self.current_cached.push(BufferValueType::Parquet);
+        self.current_row_id += records_read;
+        Ok(records_read)
     }
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {
@@ -728,13 +744,12 @@ impl ArrayReader for CachedArrayReader {
         final_array.push(parquet_records.as_ref());
 
         if parquet_records.len() > 0 && final_array.len() == 1 && parquet_count == 1 {
+            let row_id = self.current_row_id - parquet_records.len();
+            let row_batch_id = row_id / 8192 * 8192;
+
             // no cached records
             // only one parquet read
-            let batch_id = ArrayIdentifier::new(
-                self.row_group_id,
-                self.column_id,
-                self.current_row_id - parquet_records.len(),
-            );
+            let batch_id = ArrayIdentifier::new(self.row_group_id, self.column_id, row_batch_id);
             ArrowArrayCache::get().insert_arrow_array(&batch_id, parquet_records.clone());
         }
 
