@@ -83,14 +83,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use arrow_select::filter::prep_null_mask_filter;
 use bytes::{Buf, Bytes};
 use futures::future::{BoxFuture, FutureExt};
 use futures::ready;
 use futures::stream::Stream;
+use itertools::Itertools;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 
-use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Fields, Schema, SchemaRef};
+use arrow_array::{Array, RecordBatch};
+use arrow_schema::{DataType, Fields, Schema, SchemaBuilder, SchemaRef};
 
 use crate::arrow::array_reader::RowGroups;
 use crate::arrow::arrow_reader::{
@@ -110,6 +112,7 @@ use crate::file::page_index::offset_index::OffsetIndexMetaData;
 use crate::file::reader::{ChunkReader, Length, SerializedPageReader};
 use crate::file::FOOTER_SIZE;
 use crate::format::{BloomFilterAlgorithm, BloomFilterCompression, BloomFilterHash};
+use crate::schema::types::Type;
 
 mod metadata;
 pub use metadata::*;
@@ -117,11 +120,12 @@ pub use metadata::*;
 #[cfg(feature = "object_store")]
 mod store;
 
-use crate::arrow::schema::ParquetField;
+use crate::arrow::schema::{ParquetField, ParquetFieldType};
 #[cfg(feature = "object_store")]
 pub use store::*;
 
 use super::array_reader::build_cached_array_reader;
+use super::arrow_reader::RowSelector;
 
 /// The asynchronous interface used by [`ParquetRecordBatchStream`] to read parquet files
 ///
@@ -490,6 +494,40 @@ pub struct ReaderFactory<T> {
     offset: Option<usize>,
 }
 
+fn schema_from_projection(field: &ParquetField, mask: &ProjectionMask) -> Schema {
+    let arrow_fields = match &field.arrow_type {
+        DataType::Struct(children) => children,
+        _ => unreachable!(),
+    };
+    let children = field.children().unwrap();
+    assert_eq!(arrow_fields.len(), children.len());
+
+    let mut builder = SchemaBuilder::with_capacity(children.len());
+
+    for (arrow, parquet) in arrow_fields.iter().zip(children) {
+        let (col_idx, _primitive_type) = match &parquet.field_type {
+            ParquetFieldType::Primitive {
+                col_idx,
+                primitive_type,
+            } => match primitive_type.as_ref() {
+                Type::PrimitiveType { .. } => (*col_idx, primitive_type.clone()),
+                Type::GroupType { .. } => unimplemented!(),
+            },
+            _ => unimplemented!(),
+        };
+        if mask.leaf_included(col_idx) {
+            builder.push(
+                arrow
+                    .as_ref()
+                    .clone()
+                    .with_data_type(parquet.arrow_type.clone()),
+            );
+        }
+    }
+
+    builder.finish()
+}
+
 impl<T> ReaderFactory<T>
 where
     T: AsyncFileReader + Send,
@@ -500,7 +538,7 @@ where
     async fn read_row_group(
         mut self,
         row_group_idx: usize,
-        mut selection: Option<RowSelection>,
+        selection: Option<RowSelection>,
         projection: ProjectionMask,
         batch_size: usize,
     ) -> ReadResult<T> {
@@ -522,50 +560,121 @@ where
             offset_index,
         };
 
+        let mut selection = match selection {
+            Some(s) => s,
+            None => RowSelection::from(vec![RowSelector::select(row_group.row_count)]),
+        };
+
         if let Some(filter) = self.filter.as_mut() {
             for predicate in filter.predicates.iter_mut() {
-                if !selects_any(selection.as_ref()) {
+                if !selection.selects_any() {
                     return Ok((self, None));
                 }
 
                 let predicate_projection = predicate.projection();
+                let schema =
+                    schema_from_projection(self.fields.as_deref().unwrap(), &predicate_projection);
+
+                let column_idx = predicate_projection
+                    .column_indices()
+                    .unwrap_or_else(|| (0..schema.fields().len()).collect::<Vec<_>>());
+
+                let mut selection_from_parquet = selection.clone();
+                let mut selection_from_cache = selection.clone();
+
+                let cache = ArrowArrayCache::get();
+                if let Some(cached_ranges) =
+                    cache.get_cached_ranges_of_columns(row_group_idx, &column_idx)
+                {
+                    let sorted_ranges = cached_ranges
+                        .into_iter()
+                        .sorted_by_key(|range| range.start)
+                        .collect_vec();
+                    let cached_ranges = RowSelection::from_consecutive_ranges(
+                        sorted_ranges.iter().map(|r| r.clone()),
+                        row_group.row_count,
+                    );
+
+                    // println!("selection: {:?}", selection_from_cache);
+                    selection_from_cache = selection_from_cache.and_then(&cached_ranges);
+
+                    // println!(
+                    //     "selection after intersect with cache: {:?}",
+                    //     selection_from_cache
+                    // );
+                    let record_batches = cache.get_record_batch_from_selection(
+                        row_group_idx,
+                        &selection_from_cache,
+                        &schema,
+                        &column_idx,
+                    );
+
+                    let inverted = selection_from_cache.clone().into_inverted();
+
+                    selection_from_parquet = selection_from_parquet.and_then(&inverted);
+                    // println!("selection_from_parquet: {:?}", selection_from_parquet);
+
+                    let mut filters = vec![];
+                    for batch in record_batches {
+                        let num_rows = batch.num_rows();
+                        let filter = predicate.evaluate(batch)?;
+                        assert!(filter.len() == num_rows);
+                        match filter.null_count() {
+                            0 => filters.push(filter),
+                            _ => filters.push(prep_null_mask_filter(&filter)),
+                        }
+                    }
+                    let raw = RowSelection::from_filters(&filters);
+                    // println!("raw: {:?}", raw);
+                    selection_from_cache = selection_from_cache.and_then(&raw);
+                } else {
+                    selection_from_cache =
+                        RowSelection::from(vec![RowSelector::skip(row_group.row_count)]);
+                }
+
                 row_group
-                    .fetch(&mut self.input, predicate_projection, selection.as_ref())
+                    .fetch(
+                        &mut self.input,
+                        predicate.projection(),
+                        Some(&selection_from_parquet),
+                    )
                     .await?;
 
                 let array_reader = build_cached_array_reader(
                     self.fields.as_deref(),
-                    predicate_projection,
+                    predicate.projection(),
                     &row_group,
                     row_group_idx,
                 )?;
 
-                selection = Some(evaluate_predicate(
+                let selection_from_parquet = evaluate_predicate(
                     batch_size,
                     array_reader,
-                    selection,
+                    Some(selection_from_parquet),
                     predicate.as_mut(),
-                )?);
+                )?;
+
+                selection = selection_from_cache.union(&selection_from_parquet);
             }
         }
 
         // Compute the number of rows in the selection before applying limit and offset
-        let rows_before = selection
-            .as_ref()
-            .map(|s| s.row_count())
-            .unwrap_or(row_group.row_count);
+        let rows_before = selection.row_count();
 
         if rows_before == 0 {
             return Ok((self, None));
         }
 
-        selection = apply_range(selection, row_group.row_count, self.offset, self.limit);
+        selection = apply_range(
+            Some(selection),
+            row_group.row_count,
+            self.offset,
+            self.limit,
+        )
+        .unwrap();
 
         // Compute the number of rows in the selection after applying limit and offset
-        let rows_after = selection
-            .as_ref()
-            .map(|s| s.row_count())
-            .unwrap_or(row_group.row_count);
+        let rows_after = selection.row_count();
 
         // Update offset if necessary
         if let Some(offset) = &mut self.offset {
@@ -583,7 +692,7 @@ where
         }
 
         row_group
-            .fetch(&mut self.input, &projection, selection.as_ref())
+            .fetch(&mut self.input, &projection, Some(&selection))
             .await?;
 
         let cached_reader = build_cached_array_reader(
@@ -593,7 +702,7 @@ where
             row_group_idx,
         )?;
 
-        let reader = ParquetRecordBatchReader::new(batch_size, cached_reader, selection);
+        let reader = ParquetRecordBatchReader::new(batch_size, cached_reader, Some(selection));
 
         Ok((self, Some(reader)))
     }

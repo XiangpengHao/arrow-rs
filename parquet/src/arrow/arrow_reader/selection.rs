@@ -48,6 +48,11 @@ impl RowSelector {
             skip: true,
         }
     }
+
+    /// Invert the selector
+    pub fn invert(&mut self) {
+        self.skip = !self.skip;
+    }
 }
 
 /// [`RowSelection`] allows selecting or skipping a provided number of rows
@@ -209,6 +214,14 @@ impl RowSelection {
         }
 
         ranges
+    }
+
+    /// Invert a selection
+    pub fn into_inverted(mut self) -> Self {
+        for selector in self.selectors.iter_mut() {
+            selector.invert();
+        }
+        self
     }
 
     /// Splits off the first `row_count` from this [`RowSelection`]
