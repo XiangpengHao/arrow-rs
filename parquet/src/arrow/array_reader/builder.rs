@@ -51,6 +51,7 @@ use crate::arrow::array_reader::{
     FixedSizeListArrayReader, ListArrayReader, MapArrayReader, NullArrayReader,
     PrimitiveArrayReader, RowGroups, StructArrayReader,
 };
+use crate::arrow::arrow_reader::RowSelection;
 use crate::arrow::schema::{ParquetField, ParquetFieldType};
 use crate::arrow::ProjectionMask;
 use crate::basic::Type as PhysicalType;
@@ -318,7 +319,7 @@ impl ArrowArrayCache {
 
     /// Returns a list of ranges that are cached.
     /// The ranges are sorted by the starting row id.
-    pub fn get_cached_ranges(
+    pub fn get_cached_ranges_of_column(
         &self,
         row_group_id: usize,
         column_id: usize,
@@ -334,6 +335,110 @@ impl ArrowArrayCache {
             result_ranges.insert(start..end);
         }
         Some(result_ranges)
+    }
+
+    /// Get a record batch from a row selection.
+    pub fn get_record_batch_from_selection(
+        &self,
+        row_group_id: usize,
+        selection: &RowSelection,
+        schema: &Schema,
+        parquet_column_ids: &[usize],
+    ) -> Vec<RecordBatch> {
+        let mut record_batches = Vec::new();
+
+        let mut row_id = 0;
+
+        for row_selector in selection.iter() {
+            if row_selector.skip {
+                row_id += row_selector.row_count;
+                continue;
+            }
+
+            let mut current_selected = 0;
+            while current_selected < row_selector.row_count {
+                let current_row_id = row_id + current_selected;
+                let batch_row_id = current_row_id / 8192 * 8192; // TODO: batch size may not be 8192
+                let batch_row_count = 8192 - (current_row_id % 8192);
+
+                let mut columns = Vec::new();
+                for &column_id in parquet_column_ids {
+                    let id = ArrayIdentifier::new(row_group_id, column_id, batch_row_id);
+                    let mut array = self.get_arrow_array(&id).unwrap();
+                    if batch_row_id < current_row_id {
+                        array = array.slice(current_row_id - batch_row_id, batch_row_count);
+                    }
+                    columns.push(array);
+                }
+
+                assert!(columns.len() == parquet_column_ids.len());
+                let record_batch = RecordBatch::try_new(Arc::new(schema.clone()), columns).unwrap();
+                let actual_row_count = record_batch.num_rows(); // might be less than batch_row_count if we reach the end of the row group.
+                record_batches.push(record_batch);
+
+                current_selected += actual_row_count;
+            }
+
+            assert_eq!(current_selected, row_selector.row_count);
+
+            row_id += row_selector.row_count;
+        }
+        record_batches
+    }
+
+    /// Get a record batch from the cached ranges
+    pub fn get_record_batch_from_ranges<'a>(
+        &self,
+        row_group_id: usize,
+        schema: &Schema,
+        ranges: impl Iterator<Item = &'a Range<usize>>,
+        parquet_column_ids: &[usize],
+    ) -> Vec<RecordBatch> {
+        let mut record_batches = Vec::new();
+
+        for range in ranges {
+            let mut columns = Vec::new();
+
+            for &column_id in parquet_column_ids {
+                let id = ArrayIdentifier::new(row_group_id, column_id, range.start);
+                let array = self.get_arrow_array(&id).unwrap();
+                columns.push(array);
+            }
+
+            assert!(columns.len() == parquet_column_ids.len());
+
+            let record_batch = RecordBatch::try_new(Arc::new(schema.clone()), columns).unwrap();
+            record_batches.push(record_batch);
+        }
+
+        record_batches
+    }
+
+    /// Returns the cached ranges for the given row group and column indices.
+    ///
+    /// It returns the **intersection** of the cached ranges for the given column indices.
+    /// If any column indices' cached ranges are not found, the function returns `None`.
+    pub fn get_cached_ranges_of_columns(
+        &self,
+        row_group_id: usize,
+        column_ids: &[usize],
+    ) -> Option<HashSet<Range<usize>>> {
+        let mut intersected_ranges: Option<HashSet<Range<usize>>> = None;
+
+        for column_idx in column_ids.iter() {
+            if let Some(cached_ranges) = self.get_cached_ranges_of_column(row_group_id, *column_idx)
+            {
+                intersected_ranges = match intersected_ranges {
+                    None => Some(cached_ranges),
+                    Some(existing_ranges) => {
+                        Some(intersect_ranges(existing_ranges, &cached_ranges))
+                    }
+                };
+            } else {
+                return None;
+            }
+        }
+        intersected_ranges
     }
 
     /// Get an arrow array from the cache.
@@ -516,6 +621,37 @@ impl ArrowArrayCache {
 
         stats
     }
+}
+
+/// Returns the ranges that are present in both `base` and `input`.
+/// Ranges in both sets are assumed to be non-overlapping.
+///
+/// The returned ranges are exactly those that appear in both input sets,
+/// preserving their original bounds for use in cache retrieval.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashSet;
+/// use std::ops::Range;
+///
+/// let base: HashSet<Range<usize>> = vec![0..10, 20..30, 40..45].into_iter().collect();
+/// let input: HashSet<Range<usize>> = vec![0..10, 25..35, 40..45].into_iter().collect();
+/// let result = intersect_ranges(base, input);
+/// assert_eq!(result, vec![0..10, 40..45].into_iter().collect::<HashSet<_>>());
+/// ```
+fn intersect_ranges(
+    mut base: HashSet<Range<usize>>,
+    input: &HashSet<Range<usize>>,
+) -> HashSet<Range<usize>> {
+    for range in input {
+        if base.contains(range) {
+            continue;
+        } else {
+            base.remove(range);
+        }
+    }
+    base
 }
 
 struct CachedArrayReader {

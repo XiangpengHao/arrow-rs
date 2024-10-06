@@ -211,6 +211,17 @@ impl ProjectionMask {
     pub fn leaf_included(&self, leaf_idx: usize) -> bool {
         self.mask.as_ref().map(|m| m[leaf_idx]).unwrap_or(true)
     }
+
+    /// Returns the indices of the columns that are included by the mask
+    /// For example, if the mask is [true, false, true], the function will return [0, 2]
+    pub fn column_indices(&self) -> Option<Vec<usize>> {
+        self.mask.as_ref().map(|m| {
+            m.iter()
+                .enumerate()
+                .filter_map(|(idx, &is_selected)| if is_selected { Some(idx) } else { None })
+                .collect::<Vec<_>>()
+        })
+    }
 }
 
 /// Lookups up the parquet column by name
