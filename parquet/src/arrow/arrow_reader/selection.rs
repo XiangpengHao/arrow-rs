@@ -366,6 +366,11 @@ impl RowSelection {
         union_row_selections(&self.selectors, &other.selectors)
     }
 
+    /// Returns the selectors of this [`RowSelection`]
+    pub fn selectors(&self) -> &[RowSelector] {
+        &self.selectors
+    }
+
     /// Returns `true` if this [`RowSelection`] selects any rows
     pub fn selects_any(&self) -> bool {
         self.selectors.iter().any(|x| !x.skip)
