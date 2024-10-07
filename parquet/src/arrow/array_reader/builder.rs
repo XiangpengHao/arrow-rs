@@ -32,7 +32,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_array::{DictionaryArray, RecordBatchWriter, StringArray, UInt32Array, UInt64Array};
 use arrow_ipc::reader::FileReader;
 use arrow_ipc::writer::FileWriter;
-use arrow_schema::{DataType, Field, Fields, Schema, SchemaBuilder};
+use arrow_schema::{DataType, Field, Fields, Schema, SchemaBuilder, SchemaRef};
 use vortex::arrow::FromArrowArray;
 use vortex::IntoCanonical;
 use vortex_sampling_compressor::compressors::alp::ALPCompressor;
@@ -337,12 +337,95 @@ impl ArrowArrayCache {
         Some(result_ranges)
     }
 
-    /// Get a record batch from a row selection.
-    pub fn get_record_batch_from_selection(
+    /// Get coalesced record batches from a row selection.
+    /// This function is semantically the same as `get_record_batch`,
+    /// but it tries to coalesce the record batches so that upper query engine can
+    /// read the record batches in a more efficient way.
+    ///
+    /// Note that if the selection is not sparse, this function can be slower.
+    pub fn get_coalesced_record_batches(
         &self,
         row_group_id: usize,
         selection: &RowSelection,
-        schema: &Schema,
+        schema: &SchemaRef,
+        column_idx: &[usize],
+    ) -> Vec<RecordBatch> {
+        let mut record_batches = vec![];
+        let mut row_id = 0;
+
+        let mut row_idx_of_current_batch: (usize, Vec<u32>) = (0, vec![]); // (batch_id, row_idx)
+        for row_selector in selection.iter() {
+            if row_selector.skip {
+                row_id += row_selector.row_count;
+                continue;
+            }
+            for j in 0..row_selector.row_count {
+                let new_row_idx = row_id + j;
+                if (new_row_idx / 8192 * 8192) != row_idx_of_current_batch.0 {
+                    let batch_id = row_idx_of_current_batch.0;
+                    let mut columns = Vec::with_capacity(column_idx.len());
+                    let indices = UInt32Array::from(row_idx_of_current_batch.1.clone());
+                    for &column_id in column_idx {
+                        let id = ArrayIdentifier::new(row_group_id, column_id, batch_id);
+                        let mut array = self.get_arrow_array(&id).unwrap();
+                        array = arrow_select::take::take(&array, &indices, None).unwrap();
+                        columns.push(array);
+                    }
+                    let record_batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+                    record_batches.push(record_batch);
+
+                    row_idx_of_current_batch.0 = new_row_idx / 8192 * 8192;
+                    row_idx_of_current_batch.1.clear();
+                }
+                row_idx_of_current_batch
+                    .1
+                    .push((new_row_idx - row_idx_of_current_batch.0) as u32);
+            }
+            row_id += row_selector.row_count;
+        }
+
+        if !row_idx_of_current_batch.1.is_empty() {
+            let mut columns = Vec::with_capacity(column_idx.len());
+            let indices = UInt32Array::from(row_idx_of_current_batch.1.clone());
+            for &column_id in column_idx {
+                let id = ArrayIdentifier::new(row_group_id, column_id, row_idx_of_current_batch.0);
+                let mut array = self.get_arrow_array(&id).unwrap();
+                array = arrow_select::take::take(&array, &indices, None).unwrap();
+                columns.push(array);
+            }
+            let record_batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+            record_batches.push(record_batch);
+        }
+
+        let mut coalesced_batches = vec![];
+        let mut accumulated = (0, 0); // (num_rows, batch_idx)
+        for i in 0..record_batches.len() {
+            let batch = &record_batches[i];
+            let len = batch.num_rows();
+            if accumulated.0 + len <= 8192 {
+                accumulated.0 += len;
+            } else {
+                let prev_batches = &record_batches[accumulated.1..i];
+                let new_batch =
+                    arrow_select::concat::concat_batches(&schema, prev_batches).unwrap();
+                coalesced_batches.push(new_batch);
+                accumulated = (len, i);
+            }
+        }
+        if accumulated.0 > 0 {
+            let prev_batches = &record_batches[accumulated.1..];
+            let new_batch = arrow_select::concat::concat_batches(&schema, prev_batches).unwrap();
+            coalesced_batches.push(new_batch);
+        }
+        coalesced_batches
+    }
+
+    /// Get a record batch from a row selection.
+    pub fn get_record_batch(
+        &self,
+        row_group_id: usize,
+        selection: &RowSelection,
+        schema: &SchemaRef,
         parquet_column_ids: &[usize],
     ) -> Vec<RecordBatch> {
         let mut record_batches = Vec::new();
@@ -367,17 +450,21 @@ impl ArrowArrayCache {
                 let mut columns = Vec::new();
                 for &column_id in parquet_column_ids {
                     let id = ArrayIdentifier::new(row_group_id, column_id, batch_row_id);
-                    let array = self.get_arrow_array(&id).unwrap();
+                    let mut array = self.get_arrow_array(&id).unwrap();
+                    if offset > 0 || want_to_select < array.len() {
+                        array = array.slice(offset, want_to_select);
+                    }
                     columns.push(array);
                 }
 
                 assert!(columns.len() == parquet_column_ids.len());
-                let record_batch = RecordBatch::try_new(Arc::new(schema.clone()), columns).unwrap();
-                let record_batch = record_batch.slice(offset, want_to_select);
-                let actual_row_count = record_batch.num_rows(); // might be less than batch_row_count if we reach the end of the row group.
+                let record_batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+
+                assert_eq!(record_batch.num_rows(), want_to_select);
+
                 record_batches.push(record_batch);
 
-                current_selected += actual_row_count;
+                current_selected += want_to_select;
             }
 
             assert_eq!(current_selected, row_selector.row_count);

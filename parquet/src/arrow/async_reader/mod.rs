@@ -574,8 +574,10 @@ where
                 }
 
                 let predicate_projection = predicate.projection();
-                let schema =
-                    schema_from_projection(self.fields.as_deref().unwrap(), &predicate_projection);
+                let schema = Arc::new(schema_from_projection(
+                    self.fields.as_deref().unwrap(),
+                    &predicate_projection,
+                ));
 
                 let column_idx = predicate_projection
                     .column_indices()
@@ -599,7 +601,7 @@ where
 
                     selection_from_cache = selection_from_cache.and_then(&cached_ranges);
 
-                    let record_batches = cache.get_record_batch_from_selection(
+                    let record_batches = cache.get_record_batch(
                         row_group_idx,
                         &selection_from_cache,
                         &schema,
@@ -686,7 +688,10 @@ where
             *limit -= rows_after;
         }
 
-        let schema = schema_from_projection(self.fields.as_deref().unwrap(), &projection);
+        let schema = Arc::new(schema_from_projection(
+            self.fields.as_deref().unwrap(),
+            &projection,
+        ));
         let column_ids = projection
             .column_indices()
             .unwrap_or_else(|| (0..schema.fields().len()).collect());
@@ -710,7 +715,27 @@ where
             };
 
         let cached_record_batch_reader = cached_selection.map(|selection| {
-            CacheRecordBatchReader::new(row_group_idx, selection, Arc::new(schema), column_ids)
+            let selected = selection.row_count();
+            let skipped = selection.skipped_row_count();
+            let record_batches = if selected < skipped {
+                // estimate sparsity, if selection is less than 50% of total rows,
+                // we should try to coalesce the selection (which has overhead of its own)
+                // otherwise, we just emit the sliced record batches
+                ArrowArrayCache::get().get_coalesced_record_batches(
+                    row_group_idx,
+                    &selection,
+                    &schema,
+                    &column_ids,
+                )
+            } else {
+                ArrowArrayCache::get().get_record_batch(
+                    row_group_idx,
+                    &selection,
+                    &schema,
+                    &column_ids,
+                )
+            };
+            CacheRecordBatchReader::new(record_batches)
         });
 
         row_group
@@ -736,43 +761,8 @@ struct CacheRecordBatchReader {
 }
 
 impl CacheRecordBatchReader {
-    pub fn new(
-        row_group_idx: usize,
-        selection: RowSelection,
-        schema: SchemaRef,
-        column_idx: Vec<usize>,
-    ) -> Self {
-        let record_batches = ArrowArrayCache::get().get_record_batch_from_selection(
-            row_group_idx,
-            &selection,
-            &schema,
-            &column_idx,
-        );
-
-        let mut coalesced_batches = vec![];
-        let mut accumulated = (0, 0); // (num_rows, batch_idx)
-        for i in 0..record_batches.len() {
-            let batch = &record_batches[i];
-            let len = batch.num_rows();
-            if accumulated.0 + len <= 8192 {
-                accumulated.0 += len;
-            } else {
-                let prev_batches = &record_batches[accumulated.1..i];
-                let new_batch =
-                    arrow_select::concat::concat_batches(&schema, prev_batches).unwrap();
-                coalesced_batches.push(new_batch);
-                accumulated = (len, i);
-            }
-        }
-        if accumulated.0 > 0 {
-            let prev_batches = &record_batches[accumulated.1..];
-            let new_batch = arrow_select::concat::concat_batches(&schema, prev_batches).unwrap();
-            coalesced_batches.push(new_batch);
-        }
-
-        Self {
-            record_batches: coalesced_batches,
-        }
+    pub fn new(record_batches: Vec<RecordBatch>) -> Self {
+        Self { record_batches }
     }
 
     pub fn next(&mut self) -> Option<RecordBatch> {
