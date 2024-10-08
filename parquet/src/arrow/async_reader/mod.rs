@@ -583,8 +583,8 @@ where
                     .column_indices()
                     .unwrap_or_else(|| (0..schema.fields().len()).collect::<Vec<_>>());
 
-                let mut selection_from_parquet = selection.clone();
-                let mut selection_from_cache = selection.clone();
+                let selection_from_parquet;
+                let mut selection_from_cache;
 
                 let cache = ArrowArrayCache::get();
                 if let Some(cached_ranges) =
@@ -599,7 +599,7 @@ where
                         row_group.row_count,
                     );
 
-                    selection_from_cache = selection_from_cache.and_then(&cached_ranges);
+                    selection_from_cache = selection.intersection(&cached_ranges);
 
                     let record_batches = cache.get_record_batch(
                         row_group_idx,
@@ -610,7 +610,7 @@ where
 
                     let inverted = selection_from_cache.clone().into_inverted();
 
-                    selection_from_parquet = selection_from_parquet.and_then(&inverted);
+                    selection_from_parquet = selection.intersection(&inverted);
 
                     let mut filters = vec![];
                     for batch in record_batches {
@@ -627,6 +627,7 @@ where
                 } else {
                     selection_from_cache =
                         RowSelection::from(vec![RowSelector::skip(row_group.row_count)]);
+                    selection_from_parquet = selection;
                 }
 
                 row_group
@@ -695,6 +696,7 @@ where
         let column_ids = projection
             .column_indices()
             .unwrap_or_else(|| (0..schema.fields().len()).collect());
+
         let (parquet_selection, cached_selection) =
             match ArrowArrayCache::get().get_cached_ranges_of_columns(row_group_idx, &column_ids) {
                 Some(intersected_ranges) => {
@@ -738,6 +740,28 @@ where
             CacheRecordBatchReader::new(record_batches)
         });
 
+        {
+            // warm up cache
+            let aligned_selection = align_selection_to_batch_boundary(&parquet_selection, 8192);
+            row_group
+                .fetch(&mut self.input, &projection, Some(&aligned_selection))
+                .await?;
+            let array_reader = build_cached_array_reader(
+                self.fields.as_deref(),
+                &projection,
+                &row_group,
+                row_group_idx,
+            )
+            .unwrap();
+
+            let reader = ParquetRecordBatchReader::new(8192, array_reader, Some(aligned_selection));
+
+            for batch in reader {
+                // do nothing, as we populate the record batch, they will be cached for future use.
+                assert!(batch.is_ok());
+            }
+        }
+
         row_group
             .fetch(&mut self.input, &projection, Some(&parquet_selection))
             .await?;
@@ -754,6 +778,46 @@ where
 
         Ok((self, Some((reader, cached_record_batch_reader))))
     }
+}
+
+fn align_selection_to_batch_boundary(selection: &RowSelection, batch_size: usize) -> RowSelection {
+    let total_row_count = selection.iter().map(|r| r.row_count).sum::<usize>();
+
+    let mut batch_mask = vec![false; total_row_count.div_ceil(batch_size)];
+
+    let mut current_row_id = 0;
+    for s in selection.iter() {
+        if s.skip {
+            current_row_id += s.row_count;
+            continue;
+        }
+
+        let start = current_row_id / batch_size * batch_size;
+        let end = current_row_id + s.row_count;
+
+        for i in (start..end).step_by(batch_size) {
+            batch_mask[i / batch_size] = true;
+        }
+        current_row_id += s.row_count;
+    }
+
+    let mut new_selection = vec![];
+    let mut current_batch_id = 0;
+    for select in batch_mask.iter() {
+        let batch_count = if current_batch_id + batch_size < total_row_count {
+            batch_size
+        } else {
+            total_row_count - current_batch_id
+        };
+        if *select {
+            new_selection.push(RowSelector::select(batch_count));
+        } else {
+            new_selection.push(RowSelector::skip(batch_count));
+        }
+        current_batch_id += batch_count;
+    }
+
+    RowSelection::from(new_selection)
 }
 
 struct CacheRecordBatchReader {
@@ -2333,5 +2397,72 @@ mod tests {
         // Panics here
         let result = reader.try_collect::<Vec<_>>().await.unwrap();
         assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_align_selection_to_batch_boundary() {
+        // Helper function to create a RowSelection
+        fn create_selection(selectors: Vec<(bool, usize)>) -> RowSelection {
+            RowSelection::from(
+                selectors
+                    .into_iter()
+                    .map(|(select, count)| {
+                        if select {
+                            RowSelector::select(count)
+                        } else {
+                            RowSelector::skip(count)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+
+        // Test case 1: Irregular ranges, batch size 10
+        let input = create_selection(vec![
+            (true, 3),
+            (false, 5),
+            (true, 7),
+            (false, 2),
+            (true, 8),
+        ]);
+        let output = align_selection_to_batch_boundary(&input, 10);
+        assert_eq!(
+            output,
+            create_selection(vec![(true, 10), (true, 10), (true, 5)])
+        );
+
+        // Test case 2: Irregular ranges, batch size 8
+        let input = create_selection(vec![
+            (false, 2),
+            (true, 5),
+            (false, 3),
+            (true, 6),
+            (false, 4),
+        ]);
+        let output = align_selection_to_batch_boundary(&input, 8);
+        assert_eq!(
+            output,
+            create_selection(vec![(true, 8), (true, 8), (false, 4)])
+        );
+
+        // Test case 3: Selection starts with skip, batch size 5
+        let input = create_selection(vec![(false, 3), (true, 4), (false, 2), (true, 1)]);
+        let output = align_selection_to_batch_boundary(&input, 5);
+        assert_eq!(output, create_selection(vec![(true, 5), (true, 5)]));
+
+        // Test case 4: Large batch size
+        let input = create_selection(vec![(true, 5), (false, 10), (true, 15)]);
+        let output = align_selection_to_batch_boundary(&input, 20);
+        assert_eq!(output, create_selection(vec![(true, 20), (true, 10)]));
+
+        // Test case 5: Batch size larger than total row count
+        let input = create_selection(vec![(true, 3), (false, 2), (true, 4)]);
+        let output = align_selection_to_batch_boundary(&input, 15);
+        assert_eq!(output, create_selection(vec![(true, 9)]));
+
+        // Test case 6: Ensure last range doesn't exceed total row count
+        let input = create_selection(vec![(true, 7), (false, 5), (true, 3)]);
+        let output = align_selection_to_batch_boundary(&input, 10);
+        assert_eq!(output, create_selection(vec![(true, 10), (true, 5)]));
     }
 }

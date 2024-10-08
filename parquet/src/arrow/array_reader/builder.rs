@@ -362,20 +362,21 @@ impl ArrowArrayCache {
             for j in 0..row_selector.row_count {
                 let new_row_idx = row_id + j;
                 if (new_row_idx / 8192 * 8192) != row_idx_of_current_batch.0 {
-                    let batch_id = row_idx_of_current_batch.0;
-                    let mut columns = Vec::with_capacity(column_idx.len());
-                    let indices = UInt32Array::from(row_idx_of_current_batch.1.clone());
-                    for &column_id in column_idx {
-                        let id = ArrayIdentifier::new(row_group_id, column_id, batch_id);
-                        let mut array = self.get_arrow_array(&id).unwrap();
-                        array = arrow_select::take::take(&array, &indices, None).unwrap();
-                        columns.push(array);
+                    if !row_idx_of_current_batch.1.is_empty() {
+                        let batch_id = row_idx_of_current_batch.0;
+                        let mut columns = Vec::with_capacity(column_idx.len());
+                        let indices = UInt32Array::from(row_idx_of_current_batch.1.clone());
+                        for &column_id in column_idx {
+                            let id = ArrayIdentifier::new(row_group_id, column_id, batch_id);
+                            let mut array = self.get_arrow_array(&id).unwrap();
+                            array = arrow_select::take::take(&array, &indices, None).unwrap();
+                            columns.push(array);
+                        }
+                        let record_batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+                        record_batches.push(record_batch);
+                        row_idx_of_current_batch.1.clear();
                     }
-                    let record_batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
-                    record_batches.push(record_batch);
-
                     row_idx_of_current_batch.0 = new_row_idx / 8192 * 8192;
-                    row_idx_of_current_batch.1.clear();
                 }
                 row_idx_of_current_batch
                     .1
@@ -471,34 +472,6 @@ impl ArrowArrayCache {
 
             row_id += row_selector.row_count;
         }
-        record_batches
-    }
-
-    /// Get a record batch from the cached ranges
-    pub fn get_record_batch_from_ranges<'a>(
-        &self,
-        row_group_id: usize,
-        schema: &Schema,
-        ranges: impl Iterator<Item = &'a Range<usize>>,
-        parquet_column_ids: &[usize],
-    ) -> Vec<RecordBatch> {
-        let mut record_batches = Vec::new();
-
-        for range in ranges {
-            let mut columns = Vec::new();
-
-            for &column_id in parquet_column_ids {
-                let id = ArrayIdentifier::new(row_group_id, column_id, range.start);
-                let array = self.get_arrow_array(&id).unwrap();
-                columns.push(array);
-            }
-
-            assert!(columns.len() == parquet_column_ids.len());
-
-            let record_batch = RecordBatch::try_new(Arc::new(schema.clone()), columns).unwrap();
-            record_batches.push(record_batch);
-        }
-
         record_batches
     }
 
@@ -742,13 +715,7 @@ fn intersect_ranges(
     mut base: HashSet<Range<usize>>,
     input: &HashSet<Range<usize>>,
 ) -> HashSet<Range<usize>> {
-    for range in input {
-        if base.contains(range) {
-            continue;
-        } else {
-            base.remove(range);
-        }
-    }
+    base.retain(|range| input.contains(range));
     base
 }
 
