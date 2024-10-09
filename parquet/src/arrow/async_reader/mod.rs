@@ -568,7 +568,7 @@ where
         };
 
         if let Some(filter) = self.filter.as_mut() {
-            for predicate in filter.predicates.iter_mut() {
+            for predicate in filter.predicates.iter_mut().rev() {
                 if !selection.selects_any() {
                     return Ok((self, None));
                 }
@@ -601,7 +601,7 @@ where
 
                     selection_from_cache = selection.intersection(&cached_ranges);
 
-                    let record_batches = cache.get_record_batch(
+                    let record_batches = cache.get_record_batches(
                         row_group_idx,
                         &selection_from_cache,
                         &schema,
@@ -628,6 +628,34 @@ where
                     selection_from_cache =
                         RowSelection::from(vec![RowSelector::skip(row_group.row_count)]);
                     selection_from_parquet = selection;
+                }
+
+                if ArrowArrayCache::get().cache_enabled() {
+                    // warm up cache if there's a cache reader
+                    let aligned_selection =
+                        align_selection_to_batch_boundary(&selection_from_parquet, 8192);
+                    row_group
+                        .fetch(
+                            &mut self.input,
+                            &predicate.projection(),
+                            Some(&aligned_selection),
+                        )
+                        .await?;
+                    let array_reader = build_cached_array_reader(
+                        self.fields.as_deref(),
+                        &predicate.projection(),
+                        &row_group,
+                        row_group_idx,
+                    )
+                    .unwrap();
+
+                    let reader =
+                        ParquetRecordBatchReader::new(8192, array_reader, Some(aligned_selection));
+
+                    for batch in reader {
+                        // do nothing, as we populate the record batch, they will be cached for future use.
+                        assert!(batch.is_ok());
+                    }
                 }
 
                 row_group
@@ -717,31 +745,17 @@ where
             };
 
         let cached_record_batch_reader = cached_selection.map(|selection| {
-            let selected = selection.row_count();
-            let skipped = selection.skipped_row_count();
-            let record_batches = if selected < skipped {
-                // estimate sparsity, if selection is less than 50% of total rows,
-                // we should try to coalesce the selection (which has overhead of its own)
-                // otherwise, we just emit the sliced record batches
-                ArrowArrayCache::get().get_coalesced_record_batches(
-                    row_group_idx,
-                    &selection,
-                    &schema,
-                    &column_ids,
-                )
-            } else {
-                ArrowArrayCache::get().get_record_batch(
-                    row_group_idx,
-                    &selection,
-                    &schema,
-                    &column_ids,
-                )
-            };
+            let record_batches = ArrowArrayCache::get().get_record_batches(
+                row_group_idx,
+                &selection,
+                &schema,
+                &column_ids,
+            );
             CacheRecordBatchReader::new(record_batches)
         });
 
-        {
-            // warm up cache
+        if ArrowArrayCache::get().cache_enabled() {
+            // warm up cache if there's a cache reader
             let aligned_selection = align_selection_to_batch_boundary(&parquet_selection, 8192);
             row_group
                 .fetch(&mut self.input, &projection, Some(&aligned_selection))
@@ -1287,6 +1301,7 @@ mod tests {
             .unwrap();
         let metadata = Arc::new(metadata);
 
+        assert!(metadata.offset_index().is_none());
         assert_eq!(metadata.num_row_groups(), 1);
 
         let async_reader = TestReader {

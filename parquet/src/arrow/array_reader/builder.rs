@@ -298,7 +298,10 @@ impl ArrowArrayCache {
                         ]),
                         Default::default(),
                     )),
-                    _ => ArrowCacheMode::NoCache,
+                    _ => panic!(
+                        "Invalid cache mode: {}, must be one of [disk, inmemory, nocache, vortex]",
+                        v
+                    ),
                 }
             }),
         }
@@ -307,6 +310,11 @@ impl ArrowArrayCache {
     /// Get the static ArrowArrayCache.
     pub fn get() -> &'static ArrowArrayCache {
         &ARROW_ARRAY_CACHE
+    }
+
+    /// Check if the cache is enabled.
+    pub fn cache_enabled(&self) -> bool {
+        !matches!(self.cache_mode, ArrowCacheMode::NoCache)
     }
 
     /// Reset the cache.
@@ -422,7 +430,39 @@ impl ArrowArrayCache {
     }
 
     /// Get a record batch from a row selection.
-    pub fn get_record_batch(
+    pub fn get_record_batches(
+        &self,
+        row_group_id: usize,
+        selection: &RowSelection,
+        schema: &SchemaRef,
+        parquet_column_ids: &[usize],
+    ) -> Vec<RecordBatch> {
+        let selection_count = selection.selectors().len();
+        let total_row_count = selection.iter().map(|s| s.row_count).sum::<usize>();
+        let is_sparse = (total_row_count / 16) < selection_count;
+        // estimate sparsity, if sparse,
+        // we should try to coalesce the selection (which has overhead of its own)
+        // otherwise, we just emit the sliced record batches
+        let record_batches = if is_sparse {
+            ArrowArrayCache::get().get_coalesced_record_batches(
+                row_group_id,
+                &selection,
+                &schema,
+                &parquet_column_ids,
+            )
+        } else {
+            ArrowArrayCache::get().get_record_batch_by_slice(
+                row_group_id,
+                &selection,
+                &schema,
+                &parquet_column_ids,
+            )
+        };
+        record_batches
+    }
+
+    /// Get a record batch from a row selection.
+    pub fn get_record_batch_by_slice(
         &self,
         row_group_id: usize,
         selection: &RowSelection,
