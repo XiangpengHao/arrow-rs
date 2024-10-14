@@ -477,7 +477,10 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
 
 type ReadResult<T> = Result<(
     ReaderFactory<T>,
-    Option<(ParquetRecordBatchReader, Option<CacheRecordBatchReader>)>,
+    (
+        Option<ParquetRecordBatchReader>,
+        Option<CacheRecordBatchReader>,
+    ),
 )>;
 
 /// [`ReaderFactory`] is used by [`ParquetRecordBatchStream`] to create
@@ -570,7 +573,7 @@ where
         if let Some(filter) = self.filter.as_mut() {
             for predicate in filter.predicates.iter_mut().rev() {
                 if !selection.selects_any() {
-                    return Ok((self, None));
+                    return Ok((self, (None, None)));
                 }
 
                 let predicate_projection = predicate.projection();
@@ -583,7 +586,7 @@ where
                     .column_indices()
                     .unwrap_or_else(|| (0..schema.fields().len()).collect::<Vec<_>>());
 
-                let selection_from_parquet;
+                let mut selection_from_parquet;
                 let mut selection_from_cache;
 
                 let cache = ArrowArrayCache::get();
@@ -630,55 +633,31 @@ where
                     selection_from_parquet = selection;
                 }
 
-                if ArrowArrayCache::get().cache_enabled() {
-                    // warm up cache if there's a cache reader
-                    let aligned_selection =
-                        align_selection_to_batch_boundary(&selection_from_parquet, 8192);
-                    row_group
-                        .fetch(
-                            &mut self.input,
-                            &predicate.projection(),
-                            Some(&aligned_selection),
-                        )
-                        .await?;
-                    let array_reader = build_cached_array_reader(
+                if selection_from_parquet.selects_any() {
+                    Self::fetch_and_cache_row_group(
+                        &mut row_group,
+                        row_group_idx,
+                        &mut self.input,
                         self.fields.as_deref(),
                         &predicate.projection(),
-                        &row_group,
-                        row_group_idx,
-                    )
-                    .unwrap();
-
-                    let reader =
-                        ParquetRecordBatchReader::new(8192, array_reader, Some(aligned_selection));
-
-                    for batch in reader {
-                        // do nothing, as we populate the record batch, they will be cached for future use.
-                        assert!(batch.is_ok());
-                    }
-                }
-
-                row_group
-                    .fetch(
-                        &mut self.input,
-                        predicate.projection(),
-                        Some(&selection_from_parquet),
+                        &selection_from_parquet,
                     )
                     .await?;
 
-                let array_reader = build_cached_array_reader(
-                    self.fields.as_deref(),
-                    predicate.projection(),
-                    &row_group,
-                    row_group_idx,
-                )?;
+                    let array_reader = build_cached_array_reader(
+                        self.fields.as_deref(),
+                        predicate.projection(),
+                        &row_group,
+                        row_group_idx,
+                    )?;
 
-                let selection_from_parquet = evaluate_predicate(
-                    batch_size,
-                    array_reader,
-                    Some(selection_from_parquet),
-                    predicate.as_mut(),
-                )?;
+                    selection_from_parquet = evaluate_predicate(
+                        batch_size,
+                        array_reader,
+                        Some(selection_from_parquet),
+                        predicate.as_mut(),
+                    )?;
+                }
 
                 selection = selection_from_cache.union(&selection_from_parquet);
             }
@@ -688,7 +667,7 @@ where
         let rows_before = selection.row_count();
 
         if rows_before == 0 {
-            return Ok((self, None));
+            return Ok((self, (None, None)));
         }
 
         selection = apply_range(
@@ -710,7 +689,7 @@ where
         }
 
         if rows_after == 0 {
-            return Ok((self, None));
+            return Ok((self, (None, None)));
         }
 
         if let Some(limit) = &mut self.limit {
@@ -754,19 +733,54 @@ where
             CacheRecordBatchReader::new(record_batches)
         });
 
-        if ArrowArrayCache::get().cache_enabled() {
-            // warm up cache if there's a cache reader
-            let aligned_selection = align_selection_to_batch_boundary(&parquet_selection, 8192);
-            row_group
-                .fetch(&mut self.input, &projection, Some(&aligned_selection))
-                .await?;
-            let array_reader = build_cached_array_reader(
+        let parquet_record_batch_reader = if parquet_selection.selects_any() {
+            Self::fetch_and_cache_row_group(
+                &mut row_group,
+                row_group_idx,
+                &mut self.input,
+                self.fields.as_deref(),
+                &projection,
+                &parquet_selection,
+            )
+            .await?;
+
+            let parquet_reader = build_cached_array_reader(
                 self.fields.as_deref(),
                 &projection,
                 &row_group,
                 row_group_idx,
-            )
-            .unwrap();
+            )?;
+
+            let reader =
+                ParquetRecordBatchReader::new(batch_size, parquet_reader, Some(parquet_selection));
+            Some(reader)
+        } else {
+            None
+        };
+
+        Ok((
+            self,
+            (parquet_record_batch_reader, cached_record_batch_reader),
+        ))
+    }
+
+    async fn fetch_and_cache_row_group<'a>(
+        row_group: &mut InMemoryRowGroup<'a>,
+        row_group_idx: usize,
+        input: &mut T,
+        fields: Option<&ParquetField>,
+        projection: &ProjectionMask,
+        selection: &RowSelection,
+    ) -> Result<()> {
+        assert!(selection.selects_any(), "selection must select rows");
+        if ArrowArrayCache::get().cache_enabled() {
+            // warm up cache if there's a cache reader
+            let aligned_selection = align_selection_to_batch_boundary(selection, 8192);
+            row_group
+                .fetch(input, &projection, Some(&aligned_selection))
+                .await?;
+            let array_reader =
+                build_cached_array_reader(fields, &projection, row_group, row_group_idx).unwrap();
 
             let reader = ParquetRecordBatchReader::new(8192, array_reader, Some(aligned_selection));
 
@@ -774,23 +788,12 @@ where
                 // do nothing, as we populate the record batch, they will be cached for future use.
                 assert!(batch.is_ok());
             }
+        } else {
+            row_group
+                .fetch(input, &projection, Some(&selection))
+                .await?;
         }
-
-        row_group
-            .fetch(&mut self.input, &projection, Some(&parquet_selection))
-            .await?;
-
-        let cached_reader = build_cached_array_reader(
-            self.fields.as_deref(),
-            &projection,
-            &row_group,
-            row_group_idx,
-        )?;
-
-        let reader =
-            ParquetRecordBatchReader::new(batch_size, cached_reader, Some(parquet_selection));
-
-        Ok((self, Some((reader, cached_record_batch_reader))))
+        Ok(())
     }
 }
 
@@ -852,7 +855,12 @@ enum StreamState<T> {
     /// At the start of a new row group, or the end of the parquet stream
     Init,
     /// Decoding a batch
-    Decoding((ParquetRecordBatchReader, Option<CacheRecordBatchReader>)),
+    Decoding(
+        (
+            Option<ParquetRecordBatchReader>,
+            Option<CacheRecordBatchReader>,
+        ),
+    ),
     /// Reading data from input
     Reading(BoxFuture<'static, ReadResult<T>>),
     /// Error
@@ -931,15 +939,22 @@ where
                             batch_reader.1 = None;
                         }
                     }
-                    match parquet_reader.next() {
-                        Some(Ok(batch)) => {
-                            return Poll::Ready(Some(Ok(batch)));
+
+                    if let Some(parquet_reader) = parquet_reader {
+                        match parquet_reader.next() {
+                            Some(Ok(batch)) => {
+                                return Poll::Ready(Some(Ok(batch)));
+                            }
+                            Some(Err(e)) => {
+                                self.state = StreamState::Error;
+                                return Poll::Ready(Some(Err(ParquetError::ArrowError(
+                                    e.to_string(),
+                                ))));
+                            }
+                            None => self.state = StreamState::Init,
                         }
-                        Some(Err(e)) => {
-                            self.state = StreamState::Error;
-                            return Poll::Ready(Some(Err(ParquetError::ArrowError(e.to_string()))));
-                        }
-                        None => self.state = StreamState::Init,
+                    } else {
+                        self.state = StreamState::Init;
                     }
                 }
                 StreamState::Init => {
@@ -968,11 +983,11 @@ where
                 StreamState::Reading(f) => match ready!(f.poll_unpin(cx)) {
                     Ok((reader_factory, maybe_reader)) => {
                         self.reader = Some(reader_factory);
-                        match maybe_reader {
-                            // Read records from [`ParquetRecordBatchReader`]
-                            Some(reader) => self.state = StreamState::Decoding(reader),
-                            // All rows skipped, read next row group
-                            None => self.state = StreamState::Init,
+                        if maybe_reader.0.is_none() && maybe_reader.1.is_none() {
+                            self.state = StreamState::Init;
+                            continue;
+                        } else {
+                            self.state = StreamState::Decoding(maybe_reader);
                         }
                     }
                     Err(e) => {
