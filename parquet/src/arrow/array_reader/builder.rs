@@ -38,6 +38,7 @@ use vortex::IntoCanonical;
 use vortex_sampling_compressor::compressors::alp::ALPCompressor;
 use vortex_sampling_compressor::compressors::bitpacked::BitPackedCompressor;
 use vortex_sampling_compressor::compressors::delta::DeltaCompressor;
+use vortex_sampling_compressor::compressors::dict::DictCompressor;
 use vortex_sampling_compressor::compressors::fsst::FSSTCompressor;
 use vortex_sampling_compressor::compressors::r#for::FoRCompressor;
 use vortex_sampling_compressor::compressors::CompressorRef;
@@ -292,7 +293,7 @@ impl ArrowArrayCache {
                             &ALPCompressor as CompressorRef,
                             &BitPackedCompressor,
                             &DeltaCompressor,
-                            // &DictCompressor,
+                            &DictCompressor,
                             &FoRCompressor,
                             &FSSTCompressor,
                         ]),
