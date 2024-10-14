@@ -96,10 +96,9 @@ use arrow_schema::{DataType, Fields, Schema, SchemaBuilder, SchemaRef};
 
 use crate::arrow::array_reader::RowGroups;
 use crate::arrow::arrow_reader::{
-    apply_range, evaluate_predicate, ArrowReaderBuilder, ArrowReaderMetadata, ArrowReaderOptions,
+    apply_range, ArrowReaderBuilder, ArrowReaderMetadata, ArrowReaderOptions,
     ParquetRecordBatchReader, RowFilter, RowSelection,
 };
-use crate::arrow::builder::ArrowArrayCache;
 use crate::arrow::ProjectionMask;
 
 use crate::bloom_filter::{
@@ -124,8 +123,9 @@ use crate::arrow::schema::{ParquetField, ParquetFieldType};
 #[cfg(feature = "object_store")]
 pub use store::*;
 
-use super::array_reader::build_cached_array_reader;
-use super::arrow_reader::RowSelector;
+use super::array_reader::arrow_cache::ArrowArrayCache;
+use super::array_reader::{build_array_reader, build_cached_array_reader};
+use super::arrow_reader::{evaluate_predicate, selects_any, ArrowPredicate, RowSelector};
 
 /// The asynchronous interface used by [`ParquetRecordBatchStream`] to read parquet files
 ///
@@ -537,13 +537,10 @@ impl<T> ReaderFactory<T>
 where
     T: AsyncFileReader + Send,
 {
-    /// Reads the next row group with the provided `selection`, `projection` and `batch_size`
-    ///
-    /// Note: this captures self so that the resulting future has a static lifetime
-    async fn read_row_group(
+    async fn read_row_group_no_cache(
         mut self,
         row_group_idx: usize,
-        selection: Option<RowSelection>,
+        mut selection: Option<RowSelection>,
         projection: ProjectionMask,
         batch_size: usize,
     ) -> ReadResult<T> {
@@ -565,13 +562,107 @@ where
             offset_index,
         };
 
+        if let Some(filter) = self.filter.as_mut() {
+            for predicate in filter.predicates.iter_mut() {
+                if !selects_any(selection.as_ref()) {
+                    return Ok((self, (None, None)));
+                }
+
+                let predicate_projection = predicate.projection();
+                row_group
+                    .fetch(&mut self.input, predicate_projection, selection.as_ref())
+                    .await?;
+
+                let array_reader =
+                    build_array_reader(self.fields.as_deref(), predicate_projection, &row_group)?;
+
+                selection = Some(evaluate_predicate(
+                    batch_size,
+                    array_reader,
+                    selection,
+                    predicate.as_mut(),
+                )?);
+            }
+        }
+
+        // Compute the number of rows in the selection before applying limit and offset
+        let rows_before = selection
+            .as_ref()
+            .map(|s| s.row_count())
+            .unwrap_or(row_group.row_count);
+
+        if rows_before == 0 {
+            return Ok((self, (None, None)));
+        }
+
+        selection = apply_range(selection, row_group.row_count, self.offset, self.limit);
+
+        // Compute the number of rows in the selection after applying limit and offset
+        let rows_after = selection
+            .as_ref()
+            .map(|s| s.row_count())
+            .unwrap_or(row_group.row_count);
+
+        // Update offset if necessary
+        if let Some(offset) = &mut self.offset {
+            // Reduction is either because of offset or limit, as limit is applied
+            // after offset has been "exhausted" can just use saturating sub here
+            *offset = offset.saturating_sub(rows_before - rows_after)
+        }
+
+        if rows_after == 0 {
+            return Ok((self, (None, None)));
+        }
+
+        if let Some(limit) = &mut self.limit {
+            *limit -= rows_after;
+        }
+
+        row_group
+            .fetch(&mut self.input, &projection, selection.as_ref())
+            .await?;
+
+        let reader = ParquetRecordBatchReader::new(
+            batch_size,
+            build_array_reader(self.fields.as_deref(), &projection, &row_group)?,
+            selection,
+        );
+
+        Ok((self, (Some(reader), None)))
+    }
+
+    async fn read_row_group_with_cache(
+        mut self,
+        row_group_idx: usize,
+        selection: Option<RowSelection>,
+        projection: ProjectionMask,
+        batch_size: usize,
+    ) -> ReadResult<T> {
+        debug_assert!(
+            ArrowArrayCache::get().cache_enabled(),
+            "cache must be enabled"
+        );
+
+        let meta = self.metadata.row_group(row_group_idx);
+        let offset_index = self
+            .metadata
+            .offset_index()
+            .map(|x| x[row_group_idx].as_slice());
+
+        let mut row_group = InMemoryRowGroup {
+            metadata: meta,
+            row_count: meta.num_rows() as usize,
+            column_chunks: vec![None; meta.columns().len()],
+            offset_index,
+        };
+
         let mut selection = match selection {
             Some(s) => s,
             None => RowSelection::from(vec![RowSelector::select(row_group.row_count)]),
         };
 
         if let Some(filter) = self.filter.as_mut() {
-            for predicate in filter.predicates.iter_mut().rev() {
+            for predicate in filter.predicates.iter_mut() {
                 if !selection.selects_any() {
                     return Ok((self, (None, None)));
                 }
@@ -586,80 +677,72 @@ where
                     .column_indices()
                     .unwrap_or_else(|| (0..schema.fields().len()).collect::<Vec<_>>());
 
-                let mut selection_from_parquet;
-                let mut selection_from_cache;
-
                 let cache = ArrowArrayCache::get();
-                if let Some(cached_ranges) =
-                    cache.get_cached_ranges_of_columns(row_group_idx, &column_idx)
-                {
-                    let sorted_ranges = cached_ranges
-                        .into_iter()
-                        .sorted_by_key(|range| range.start)
-                        .collect_vec();
-                    let cached_ranges = RowSelection::from_consecutive_ranges(
-                        sorted_ranges.iter().map(|r| r.clone()),
-                        row_group.row_count,
-                    );
 
-                    selection_from_cache = selection.intersection(&cached_ranges);
+                let (mut cache_selection, mut parquet_selection) =
+                    match cache.get_cached_ranges_of_columns(row_group_idx, &column_idx) {
+                        Some(cached_ranges) => {
+                            let sorted_ranges = cached_ranges
+                                .into_iter()
+                                .sorted_by_key(|range| range.start)
+                                .collect_vec();
+                            let cached_ranges = RowSelection::from_consecutive_ranges(
+                                sorted_ranges.iter().map(|r| r.clone()),
+                                row_group.row_count,
+                            );
 
-                    let record_batches = cache.get_record_batches(
+                            let cache_selection = selection.intersection(&cached_ranges);
+
+                            let inverted = cache_selection.clone().into_inverted();
+
+                            let parquet_selection = selection.intersection(&inverted);
+                            (cache_selection, parquet_selection)
+                        }
+                        None => {
+                            let cache_selection =
+                                RowSelection::from(vec![RowSelector::skip(row_group.row_count)]);
+                            let parquet_selection = selection;
+                            (cache_selection, parquet_selection)
+                        }
+                    };
+
+                if cache_selection.selects_any() {
+                    let cached_record_batches = cache.get_record_batches(
                         row_group_idx,
-                        &selection_from_cache,
+                        &cache_selection,
                         &schema,
                         &column_idx,
                     );
-
-                    let inverted = selection_from_cache.clone().into_inverted();
-
-                    selection_from_parquet = selection.intersection(&inverted);
-
-                    let mut filters = vec![];
-                    for batch in record_batches {
-                        let num_rows = batch.num_rows();
-                        let filter = predicate.evaluate(batch)?;
-                        assert!(filter.len() == num_rows);
-                        match filter.null_count() {
-                            0 => filters.push(filter),
-                            _ => filters.push(prep_null_mask_filter(&filter)),
-                        }
-                    }
-                    let raw = RowSelection::from_filters(&filters);
-                    selection_from_cache = selection_from_cache.and_then(&raw);
-                } else {
-                    selection_from_cache =
-                        RowSelection::from(vec![RowSelector::skip(row_group.row_count)]);
-                    selection_from_parquet = selection;
+                    cache_selection = Self::evaluate_predicate(
+                        cached_record_batches,
+                        predicate,
+                        &cache_selection,
+                    )?;
                 }
 
-                if selection_from_parquet.selects_any() {
+                if parquet_selection.selects_any() {
+                    // warm up cache if there's a cache reader
                     Self::fetch_and_cache_row_group(
                         &mut row_group,
                         row_group_idx,
                         &mut self.input,
                         self.fields.as_deref(),
-                        &predicate.projection(),
-                        &selection_from_parquet,
+                        &projection,
+                        &parquet_selection,
                     )
                     .await?;
 
-                    let array_reader = build_cached_array_reader(
-                        self.fields.as_deref(),
-                        predicate.projection(),
-                        &row_group,
+                    let record_batches = cache.get_record_batches(
                         row_group_idx,
-                    )?;
-
-                    selection_from_parquet = evaluate_predicate(
-                        batch_size,
-                        array_reader,
-                        Some(selection_from_parquet),
-                        predicate.as_mut(),
-                    )?;
+                        &parquet_selection,
+                        &schema,
+                        &column_idx,
+                    );
+                    parquet_selection =
+                        Self::evaluate_predicate(record_batches, predicate, &parquet_selection)?;
                 }
 
-                selection = selection_from_cache.union(&selection_from_parquet);
+                selection = cache_selection.union(&parquet_selection);
             }
         }
 
@@ -764,6 +847,51 @@ where
         ))
     }
 
+    /// Reads the next row group with the provided `selection`, `projection` and `batch_size`
+    ///
+    /// Note: this captures self so that the resulting future has a static lifetime
+    async fn read_row_group(
+        self,
+        row_group_idx: usize,
+        selection: Option<RowSelection>,
+        projection: ProjectionMask,
+        batch_size: usize,
+    ) -> ReadResult<T> {
+        if ArrowArrayCache::get().cache_enabled() {
+            self.read_row_group_with_cache(row_group_idx, selection, projection, batch_size)
+                .await
+        } else {
+            self.read_row_group_no_cache(row_group_idx, selection, projection, batch_size)
+                .await
+        }
+    }
+
+    fn evaluate_predicate(
+        record_batches: impl IntoIterator<Item = RecordBatch>,
+        predicate: &mut Box<dyn ArrowPredicate>,
+        selection: &RowSelection,
+    ) -> Result<RowSelection> {
+        let mut filters = vec![];
+        for maybe_batch in record_batches {
+            let input_rows = maybe_batch.num_rows();
+            let filter = predicate.evaluate(maybe_batch)?;
+            // Since user supplied predicate, check error here to catch bugs quickly
+            if filter.len() != input_rows {
+                return Err(arrow_err!(
+                    "ArrowPredicate predicate returned {} rows, expected {input_rows}",
+                    filter.len()
+                ));
+            }
+            match filter.null_count() {
+                0 => filters.push(filter),
+                _ => filters.push(prep_null_mask_filter(&filter)),
+            };
+        }
+
+        let raw = RowSelection::from_filters(&filters);
+        Ok(selection.and_then(&raw))
+    }
+
     async fn fetch_and_cache_row_group<'a>(
         row_group: &mut InMemoryRowGroup<'a>,
         row_group_idx: usize,
@@ -773,26 +901,26 @@ where
         selection: &RowSelection,
     ) -> Result<()> {
         assert!(selection.selects_any(), "selection must select rows");
-        if ArrowArrayCache::get().cache_enabled() {
-            // warm up cache if there's a cache reader
-            let aligned_selection = align_selection_to_batch_boundary(selection, 8192);
-            row_group
-                .fetch(input, &projection, Some(&aligned_selection))
-                .await?;
-            let array_reader =
-                build_cached_array_reader(fields, &projection, row_group, row_group_idx).unwrap();
+        debug_assert!(
+            ArrowArrayCache::get().cache_enabled(),
+            "cache must be enabled"
+        );
 
-            let reader = ParquetRecordBatchReader::new(8192, array_reader, Some(aligned_selection));
+        // warm up cache if there's a cache reader
+        let aligned_selection = align_selection_to_batch_boundary(selection, 8192);
+        row_group
+            .fetch(input, &projection, Some(&aligned_selection))
+            .await?;
+        let array_reader =
+            build_cached_array_reader(fields, &projection, row_group, row_group_idx).unwrap();
 
-            for batch in reader {
-                // do nothing, as we populate the record batch, they will be cached for future use.
-                assert!(batch.is_ok());
-            }
-        } else {
-            row_group
-                .fetch(input, &projection, Some(&selection))
-                .await?;
+        let reader = ParquetRecordBatchReader::new(8192, array_reader, Some(aligned_selection));
+
+        for batch in reader {
+            // do nothing, as we populate the record batch, they will be cached for future use.
+            assert!(batch.is_ok());
         }
+
         Ok(())
     }
 }
