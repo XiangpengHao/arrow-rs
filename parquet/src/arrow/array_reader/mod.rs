@@ -30,7 +30,8 @@ use crate::column::reader::decoder::ColumnValueDecoder;
 use crate::file::reader::{FilePageIterator, FileReader};
 
 /// Array reader builder
-pub mod builder;
+pub mod arrow_cache;
+mod builder;
 mod byte_array;
 mod byte_array_dictionary;
 mod byte_view_array;
