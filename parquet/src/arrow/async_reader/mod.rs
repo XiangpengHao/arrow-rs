@@ -91,7 +91,7 @@ use futures::stream::Stream;
 use itertools::Itertools;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 
-use arrow_array::{Array, RecordBatch};
+use arrow_array::{Array, RecordBatch, RecordBatchReader};
 use arrow_schema::{DataType, Fields, Schema, SchemaBuilder, SchemaRef};
 
 use crate::arrow::array_reader::RowGroups;
@@ -636,7 +636,7 @@ where
         row_group_idx: usize,
         selection: Option<RowSelection>,
         projection: ProjectionMask,
-        batch_size: usize,
+        _batch_size: usize,
     ) -> ReadResult<T> {
         debug_assert!(
             ArrowArrayCache::get().cache_enabled(),
@@ -668,50 +668,51 @@ where
                 }
 
                 let predicate_projection = predicate.projection();
-                let schema = Arc::new(schema_from_projection(
+                let predicate_schema = Arc::new(schema_from_projection(
                     self.fields.as_deref().unwrap(),
                     &predicate_projection,
                 ));
 
-                let column_idx = predicate_projection
+                let predicate_column_idx = predicate_projection
                     .column_indices()
-                    .unwrap_or_else(|| (0..schema.fields().len()).collect::<Vec<_>>());
+                    .unwrap_or_else(|| (0..predicate_schema.fields().len()).collect::<Vec<_>>());
 
                 let cache = ArrowArrayCache::get();
 
-                let (mut cache_selection, mut parquet_selection) =
-                    match cache.get_cached_ranges_of_columns(row_group_idx, &column_idx) {
-                        Some(cached_ranges) => {
-                            let sorted_ranges = cached_ranges
-                                .into_iter()
-                                .sorted_by_key(|range| range.start)
-                                .collect_vec();
-                            let cached_ranges = RowSelection::from_consecutive_ranges(
-                                sorted_ranges.iter().map(|r| r.clone()),
-                                row_group.row_count,
-                            );
+                let (mut cache_selection, mut parquet_selection) = match cache
+                    .get_cached_ranges_of_columns(row_group_idx, &predicate_column_idx)
+                {
+                    Some(cached_ranges) => {
+                        let sorted_ranges = cached_ranges
+                            .into_iter()
+                            .sorted_by_key(|range| range.start)
+                            .collect_vec();
+                        let cached_ranges = RowSelection::from_consecutive_ranges(
+                            sorted_ranges.iter().map(|r| r.clone()),
+                            row_group.row_count,
+                        );
 
-                            let cache_selection = selection.intersection(&cached_ranges);
+                        let cache_selection = selection.intersection(&cached_ranges);
 
-                            let inverted = cache_selection.clone().into_inverted();
+                        let inverted = cache_selection.clone().into_inverted();
 
-                            let parquet_selection = selection.intersection(&inverted);
-                            (cache_selection, parquet_selection)
-                        }
-                        None => {
-                            let cache_selection =
-                                RowSelection::from(vec![RowSelector::skip(row_group.row_count)]);
-                            let parquet_selection = selection;
-                            (cache_selection, parquet_selection)
-                        }
-                    };
+                        let parquet_selection = selection.intersection(&inverted);
+                        (cache_selection, parquet_selection)
+                    }
+                    None => {
+                        let cache_selection =
+                            RowSelection::from(vec![RowSelector::skip(row_group.row_count)]);
+                        let parquet_selection = selection;
+                        (cache_selection, parquet_selection)
+                    }
+                };
 
                 if cache_selection.selects_any() {
                     let cached_record_batches = cache.get_record_batches(
                         row_group_idx,
                         &cache_selection,
-                        &schema,
-                        &column_idx,
+                        &predicate_schema,
+                        &predicate_column_idx,
                     );
                     cache_selection = Self::evaluate_predicate(
                         cached_record_batches,
@@ -727,7 +728,7 @@ where
                         row_group_idx,
                         &mut self.input,
                         self.fields.as_deref(),
-                        &projection,
+                        predicate.projection(),
                         &parquet_selection,
                     )
                     .await?;
@@ -735,8 +736,8 @@ where
                     let record_batches = cache.get_record_batches(
                         row_group_idx,
                         &parquet_selection,
-                        &schema,
-                        &column_idx,
+                        &predicate_schema,
+                        &predicate_column_idx,
                     );
                     parquet_selection =
                         Self::evaluate_predicate(record_batches, predicate, &parquet_selection)?;
@@ -813,7 +814,7 @@ where
                 &schema,
                 &column_ids,
             );
-            CacheRecordBatchReader::new(record_batches)
+            CacheRecordBatchReader::new(record_batches, schema.clone())
         });
 
         let parquet_record_batch_reader = if parquet_selection.selects_any() {
@@ -827,24 +828,29 @@ where
             )
             .await?;
 
-            let parquet_reader = build_cached_array_reader(
-                self.fields.as_deref(),
-                &projection,
-                &row_group,
+            // we already have the data in the cache, so we can just read from the cache
+            let record_batches = ArrowArrayCache::get().get_record_batches(
                 row_group_idx,
-            )?;
-
-            let reader =
-                ParquetRecordBatchReader::new(batch_size, parquet_reader, Some(parquet_selection));
+                &parquet_selection,
+                &schema,
+                &column_ids,
+            );
+            let reader = CacheRecordBatchReader::new(record_batches, schema.clone());
             Some(reader)
         } else {
             None
         };
+        let cached_record_batch_reader =
+            match (parquet_record_batch_reader, cached_record_batch_reader) {
+                (Some(parquet_reader), Some(cache_reader)) => {
+                    let iter = parquet_reader.iter.chain(cache_reader.iter);
+                    Some(CacheRecordBatchReader::new(Box::new(iter), schema))
+                }
+                (Some(reader), None) | (None, Some(reader)) => Some(reader),
+                (None, None) => None,
+            };
 
-        Ok((
-            self,
-            (parquet_record_batch_reader, cached_record_batch_reader),
-        ))
+        Ok((self, (None, cached_record_batch_reader)))
     }
 
     /// Reads the next row group with the provided `selection`, `projection` and `batch_size`
@@ -966,16 +972,27 @@ fn align_selection_to_batch_boundary(selection: &RowSelection, batch_size: usize
 }
 
 struct CacheRecordBatchReader {
-    record_batches: Vec<RecordBatch>,
+    iter: Box<dyn Iterator<Item = RecordBatch> + Send>,
+    schema: SchemaRef,
 }
 
 impl CacheRecordBatchReader {
-    pub fn new(record_batches: Vec<RecordBatch>) -> Self {
-        Self { record_batches }
+    pub fn new(iter: Box<dyn Iterator<Item = RecordBatch> + Send>, schema: SchemaRef) -> Self {
+        Self { iter, schema }
     }
+}
 
-    pub fn next(&mut self) -> Option<RecordBatch> {
-        self.record_batches.pop()
+impl Iterator for CacheRecordBatchReader {
+    type Item = Result<RecordBatch, arrow_schema::ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next().map(|b| Ok(b))
+    }
+}
+
+impl RecordBatchReader for CacheRecordBatchReader {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 }
 
@@ -1062,7 +1079,7 @@ where
                     let (parquet_reader, cached_reader) = batch_reader;
                     if let Some(cached_reader) = cached_reader {
                         if let Some(batch) = cached_reader.next() {
-                            return Poll::Ready(Some(Ok(batch)));
+                            return Poll::Ready(Some(Ok(batch?)));
                         } else {
                             batch_reader.1 = None;
                         }
