@@ -1,4 +1,5 @@
 use crate::arrow::arrow_reader::{RowSelection, RowSelector};
+use ahash::AHashMap;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use arrow_select::concat::concat_batches;
@@ -26,7 +27,7 @@ use arrow_array::{
 };
 use arrow_ipc::reader::FileReader;
 use arrow_ipc::writer::FileWriter;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
@@ -35,10 +36,10 @@ static ARROW_ARRAY_CACHE: LazyLock<ArrowArrayCache> =
     LazyLock::new(|| ArrowArrayCache::initialize_from_env());
 
 /// Row offset -> (Arrow Array, hit count)
-type RowMapping = HashMap<usize, CachedEntry>;
+type RowMapping = AHashMap<usize, CachedEntry>;
 
 /// Column offset -> RowMapping
-type ColumnMapping = HashMap<usize, RowMapping>;
+type ColumnMapping = AHashMap<usize, RowMapping>;
 
 #[derive(Debug, Clone)]
 enum ArrowCacheMode {
@@ -467,7 +468,7 @@ impl ArrowArrayCache {
 
         let mut cache = self.value[id.row_group_id].write().unwrap();
 
-        let column_cache = cache.entry(id.column_id).or_insert_with(HashMap::new);
+        let column_cache = cache.entry(id.column_id).or_insert_with(AHashMap::new);
 
         match &self.cache_mode {
             ArrowCacheMode::InMemory => {

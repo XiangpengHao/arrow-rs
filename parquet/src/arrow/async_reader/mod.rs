@@ -662,7 +662,7 @@ where
         };
 
         if let Some(filter) = self.filter.as_mut() {
-            for predicate in filter.predicates.iter_mut() {
+            for predicate in filter.predicates.iter_mut().rev() {
                 if !selection.selects_any() {
                     return Ok((self, (None, None)));
                 }
