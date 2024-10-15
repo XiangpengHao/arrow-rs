@@ -38,6 +38,7 @@ use crate::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use crate::file::reader::{ChunkReader, SerializedPageReader};
 use crate::schema::types::SchemaDescriptor;
 
+mod boolean_selection;
 mod filter;
 mod selection;
 pub mod statistics;
