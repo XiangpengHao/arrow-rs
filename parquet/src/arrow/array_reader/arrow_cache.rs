@@ -1,5 +1,6 @@
 use crate::arrow::arrow_reader::{RowSelection, RowSelector};
 use ahash::AHashMap;
+use arrow_data::bit_iterator::BitIndexIterator;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use arrow_select::concat::concat_batches;
@@ -327,6 +328,24 @@ impl ArrowArrayCache {
         Some(result_ranges)
     }
 
+    /// Get a record batch iterator from a boolean selection.
+    pub fn get_record_batches_by_boolean_selection<'a, 'b: 'a>(
+        &'a self,
+        row_group_id: usize,
+        selection: BitIndexIterator<'b>,
+        schema: &SchemaRef,
+        parquet_column_ids: &[usize],
+    ) -> Box<dyn Iterator<Item = RecordBatch> + Send + 'a> {
+        Box::new(BooleanSelectionIter::new(
+            self,
+            row_group_id,
+            selection,
+            schema.clone(),
+            parquet_column_ids.to_vec(),
+            self.batch_size,
+        ))
+    }
+
     /// Get a record batch from a row selection.
     pub fn get_record_batches(
         &self,
@@ -344,14 +363,14 @@ impl ArrowArrayCache {
         if is_sparse {
             Box::new(ArrowArrayCache::get().get_coalesced_record_batch_iter(
                 row_group_id,
-                &selection,
+                selection,
                 &schema,
                 &parquet_column_ids,
             ))
         } else {
             Box::new(ArrowArrayCache::get().get_record_batch_by_slice_iter(
                 row_group_id,
-                &selection,
+                selection,
                 &schema,
                 &parquet_column_ids,
             ))
@@ -777,13 +796,13 @@ impl<'a> CoalescedRecordBatchIter<'a> {
             Some(coalesced)
         }
     }
+}
 
-    fn make_dummy_record_batch(&self, len: usize) -> RecordBatch {
-        let data_type = DataType::Struct(Fields::empty());
-        let array = ArrayDataBuilder::new(data_type).len(len).build().unwrap();
-        let array = StructArray::from(array);
-        RecordBatch::try_new(self.schema.clone(), vec![Arc::new(array)]).unwrap()
-    }
+fn make_dummy_record_batch(schema: &SchemaRef, len: usize) -> RecordBatch {
+    let data_type = DataType::Struct(Fields::empty());
+    let array = ArrayDataBuilder::new(data_type).len(len).build().unwrap();
+    let array = StructArray::from(array);
+    RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap()
 }
 
 impl<'a> Iterator for CoalescedRecordBatchIter<'a> {
@@ -805,7 +824,10 @@ impl<'a> Iterator for CoalescedRecordBatchIter<'a> {
                         let batch_id = self.row_idx_of_current_batch.0;
                         let record_batch = if self.projected_column_ids.is_empty() {
                             // means we just make arrays with empty content but keep the row count.
-                            self.make_dummy_record_batch(self.row_idx_of_current_batch.1.len())
+                            make_dummy_record_batch(
+                                &self.schema,
+                                self.row_idx_of_current_batch.1.len(),
+                            )
                         } else {
                             let mut columns = Vec::with_capacity(self.schema.fields().len());
                             let indices =
@@ -843,11 +865,138 @@ impl<'a> Iterator for CoalescedRecordBatchIter<'a> {
         if !self.row_idx_of_current_batch.1.is_empty() {
             let batch_id = self.row_idx_of_current_batch.0;
             let record_batch = if self.projected_column_ids.is_empty() {
-                self.make_dummy_record_batch(self.row_idx_of_current_batch.1.len())
+                make_dummy_record_batch(&self.schema, self.row_idx_of_current_batch.1.len())
             } else {
                 let mut columns = Vec::with_capacity(self.projected_column_ids.len());
                 let indices = UInt32Array::from(self.row_idx_of_current_batch.1.clone());
                 for &column_id in &self.projected_column_ids {
+                    let id = ArrayIdentifier::new(self.row_group_id, column_id, batch_id);
+                    let mut array = self.cache.get_arrow_array(&id).unwrap();
+                    array = arrow_select::take::take(&array, &indices, None).unwrap();
+                    columns.push(array);
+                }
+                RecordBatch::try_new(self.schema.clone(), columns).unwrap()
+            };
+
+            self.record_batch_buffer.push(record_batch);
+            let coalesced = concat_batches(&self.schema, &self.record_batch_buffer).unwrap();
+            self.row_idx_of_current_batch.1.clear();
+            return Some(coalesced);
+        }
+        None
+    }
+}
+
+struct BooleanSelectionIter<'a, 'b> {
+    cache: &'a ArrowArrayCache,
+    selection_iter: BitIndexIterator<'b>,
+    row_group_id: usize,
+    schema: SchemaRef,
+    parquet_column_ids: Vec<usize>,
+    batch_size: usize,
+    row_idx_of_current_batch: (usize, Vec<u32>),
+    record_batch_buffer: Vec<RecordBatch>,
+}
+
+impl<'a, 'b> BooleanSelectionIter<'a, 'b> {
+    fn new(
+        cache: &'a ArrowArrayCache,
+        row_group_id: usize,
+        selection_iter: BitIndexIterator<'b>,
+        schema: SchemaRef,
+        parquet_column_ids: Vec<usize>,
+        batch_size: usize,
+    ) -> Self {
+        Self {
+            cache,
+            selection_iter,
+            row_group_id,
+            schema,
+            parquet_column_ids,
+            batch_size,
+            row_idx_of_current_batch: (0, vec![]),
+            record_batch_buffer: vec![],
+        }
+    }
+}
+
+/// Add a record batch to the buffer.
+/// If the buffer is full, coalesce the buffer and return the coalesced batch and clear the buffer.
+/// Otherwise, return `None`.
+fn add_record_batch_to_buffer(
+    record_batch_buffer: &mut Vec<RecordBatch>,
+    record_batch: RecordBatch,
+    batch_size: usize,
+) -> Option<RecordBatch> {
+    let existing_row_count = record_batch_buffer
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum::<usize>();
+    if existing_row_count + record_batch.num_rows() < batch_size {
+        record_batch_buffer.push(record_batch);
+        None
+    } else {
+        let schema = record_batch.schema();
+        record_batch_buffer.push(record_batch);
+        let buffer = std::mem::replace(record_batch_buffer, vec![]);
+        let coalesced = concat_batches(&schema, &buffer).unwrap();
+        Some(coalesced)
+    }
+}
+
+impl<'a, 'b> Iterator for BooleanSelectionIter<'a, 'b> {
+    type Item = RecordBatch;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for row_id in &mut self.selection_iter {
+            let batch_id = row_id / self.batch_size * self.batch_size;
+
+            if batch_id != self.row_idx_of_current_batch.0 {
+                if !self.row_idx_of_current_batch.1.is_empty() {
+                    let old_batch_id = self.row_idx_of_current_batch.0;
+                    let record_batch = if self.parquet_column_ids.is_empty() {
+                        make_dummy_record_batch(&self.schema, self.row_idx_of_current_batch.1.len())
+                    } else {
+                        let mut columns = Vec::with_capacity(self.schema.fields().len());
+                        let indices = UInt32Array::from(self.row_idx_of_current_batch.1.clone());
+                        for &column_id in &self.parquet_column_ids {
+                            let id =
+                                ArrayIdentifier::new(self.row_group_id, column_id, old_batch_id);
+                            let mut array = self.cache.get_arrow_array(&id).unwrap();
+                            array = arrow_select::take::take(&array, &indices, None).unwrap();
+                            columns.push(array);
+                        }
+                        RecordBatch::try_new(self.schema.clone(), columns).unwrap()
+                    };
+                    let coalesced = add_record_batch_to_buffer(
+                        &mut self.record_batch_buffer,
+                        record_batch,
+                        self.batch_size,
+                    );
+                    self.row_idx_of_current_batch.1.clear();
+                    if let Some(coalesced) = coalesced {
+                        self.row_idx_of_current_batch.0 = batch_id;
+                        self.row_idx_of_current_batch
+                            .1
+                            .push((row_id - batch_id) as u32);
+                        return Some(coalesced);
+                    }
+                }
+                self.row_idx_of_current_batch.0 = batch_id;
+            }
+            self.row_idx_of_current_batch
+                .1
+                .push((row_id - batch_id) as u32);
+        }
+
+        if !self.row_idx_of_current_batch.1.is_empty() {
+            let batch_id = self.row_idx_of_current_batch.0;
+            let record_batch = if self.parquet_column_ids.is_empty() {
+                make_dummy_record_batch(&self.schema, self.row_idx_of_current_batch.1.len())
+            } else {
+                let mut columns = Vec::with_capacity(self.schema.fields().len());
+                let indices = UInt32Array::from(self.row_idx_of_current_batch.1.clone());
+                for &column_id in &self.parquet_column_ids {
                     let id = ArrayIdentifier::new(self.row_group_id, column_id, batch_id);
                     let mut array = self.cache.get_arrow_array(&id).unwrap();
                     array = arrow_select::take::take(&array, &indices, None).unwrap();
@@ -880,6 +1029,8 @@ fn intersect_ranges(
 
 #[cfg(test)]
 mod tests {
+    use crate::arrow::arrow_reader::BooleanSelection;
+
     use super::*;
     use arrow::array::{ArrayRef, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1019,6 +1170,27 @@ mod tests {
                 .get_coalesced_record_batch_iter(
                     row_group_id,
                     &selection,
+                    &schema,
+                    &parquet_column_ids,
+                )
+                .collect::<Vec<_>>();
+            assert_eq!(record_batches.len(), expected.len());
+            for (batch, expected) in record_batches.into_iter().zip(expected) {
+                let actual = batch.column(0).as_primitive::<ArrowInt32Type>();
+                assert_eq!(actual, &expected);
+            }
+        }
+
+        for (selection, expected) in selections.iter() {
+            let expected = expected
+                .into_iter()
+                .map(|range| Int32Array::from_iter_values(range.into_iter().map(|x| *x)));
+            let selection = BooleanSelection::from(RowSelection::from(selection.clone()));
+            let selection_iter = selection.positive_iter();
+            let record_batches = cache
+                .get_record_batches_by_boolean_selection(
+                    row_group_id,
+                    selection_iter,
                     &schema,
                     &parquet_column_ids,
                 )

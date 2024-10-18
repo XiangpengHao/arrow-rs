@@ -96,7 +96,7 @@ use arrow_schema::{DataType, Fields, Schema, SchemaBuilder, SchemaRef};
 
 use crate::arrow::array_reader::RowGroups;
 use crate::arrow::arrow_reader::{
-    apply_range, ArrowReaderBuilder, ArrowReaderMetadata, ArrowReaderOptions,
+    apply_range, ArrowReaderBuilder, ArrowReaderMetadata, ArrowReaderOptions, BooleanSelection,
     ParquetRecordBatchReader, RowFilter, RowSelection,
 };
 use crate::arrow::ProjectionMask;
@@ -657,8 +657,8 @@ where
         };
 
         let mut selection = match selection {
-            Some(s) => s,
-            None => RowSelection::from(vec![RowSelector::select(row_group.row_count)]),
+            Some(s) => BooleanSelection::from(s),
+            None => BooleanSelection::new_selected(row_group.row_count),
         };
 
         if let Some(filter) = self.filter.as_mut() {
@@ -687,38 +687,34 @@ where
                             .into_iter()
                             .sorted_by_key(|range| range.start)
                             .collect_vec();
-                        let cached_ranges = RowSelection::from_consecutive_ranges(
+                        let cached_ranges = BooleanSelection::from_consecutive_ranges(
                             sorted_ranges.iter().map(|r| r.clone()),
                             row_group.row_count,
                         );
 
                         let cache_selection = selection.intersection(&cached_ranges);
 
-                        let inverted = cache_selection.clone().into_inverted();
+                        let inverted = cache_selection.as_inverted();
 
                         let parquet_selection = selection.intersection(&inverted);
                         (cache_selection, parquet_selection)
                     }
                     None => {
-                        let cache_selection =
-                            RowSelection::from(vec![RowSelector::skip(row_group.row_count)]);
+                        let cache_selection = BooleanSelection::new_unselected(row_group.row_count);
                         let parquet_selection = selection;
                         (cache_selection, parquet_selection)
                     }
                 };
 
                 if cache_selection.selects_any() {
-                    let cached_record_batches = cache.get_record_batches(
+                    let cached_record_batches = cache.get_record_batches_by_boolean_selection(
                         row_group_idx,
-                        &cache_selection,
+                        cache_selection.positive_iter(),
                         &predicate_schema,
                         &predicate_column_idx,
                     );
-                    cache_selection = Self::evaluate_predicate(
-                        cached_record_batches,
-                        predicate,
-                        &cache_selection,
-                    )?;
+                    cache_selection = cache_selection
+                        .and_then(&Self::evaluate_predicate(cached_record_batches, predicate)?);
                 }
 
                 if parquet_selection.selects_any() {
@@ -729,23 +725,25 @@ where
                         &mut self.input,
                         self.fields.as_deref(),
                         predicate.projection(),
-                        &parquet_selection,
+                        &RowSelection::from(parquet_selection.clone()),
                     )
                     .await?;
 
-                    let record_batches = cache.get_record_batches(
+                    let record_batches = cache.get_record_batches_by_boolean_selection(
                         row_group_idx,
-                        &parquet_selection,
+                        parquet_selection.positive_iter(),
                         &predicate_schema,
                         &predicate_column_idx,
                     );
-                    parquet_selection =
-                        Self::evaluate_predicate(record_batches, predicate, &parquet_selection)?;
+                    parquet_selection = parquet_selection
+                        .and_then(&Self::evaluate_predicate(record_batches, predicate)?);
                 }
 
                 selection = cache_selection.union(&parquet_selection);
             }
         }
+
+        let mut selection = RowSelection::from(selection);
 
         // Compute the number of rows in the selection before applying limit and offset
         let rows_before = selection.row_count();
@@ -875,8 +873,7 @@ where
     fn evaluate_predicate(
         record_batches: impl IntoIterator<Item = RecordBatch>,
         predicate: &mut Box<dyn ArrowPredicate>,
-        selection: &RowSelection,
-    ) -> Result<RowSelection> {
+    ) -> Result<BooleanSelection> {
         let mut filters = vec![];
         for maybe_batch in record_batches {
             let input_rows = maybe_batch.num_rows();
@@ -894,8 +891,8 @@ where
             };
         }
 
-        let raw = RowSelection::from_filters(&filters);
-        Ok(selection.and_then(&raw))
+        let raw = BooleanSelection::from_filters(&filters);
+        Ok(raw)
     }
 
     async fn fetch_and_cache_row_group<'a>(
