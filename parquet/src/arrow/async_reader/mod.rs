@@ -709,7 +709,7 @@ where
                 if cache_selection.selects_any() {
                     let cached_record_batches = cache.get_record_batches_by_boolean_selection(
                         row_group_idx,
-                        cache_selection.positive_iter(),
+                        &cache_selection,
                         &predicate_schema,
                         &predicate_column_idx,
                     );
@@ -731,7 +731,7 @@ where
 
                     let record_batches = cache.get_record_batches_by_boolean_selection(
                         row_group_idx,
-                        parquet_selection.positive_iter(),
+                        &parquet_selection,
                         &predicate_schema,
                         &predicate_column_idx,
                     );

@@ -196,6 +196,11 @@ impl BooleanSelection {
     pub fn selects_any(&self) -> bool {
         self.row_count() > 0
     }
+
+    /// Returns a new BooleanSelection that selects the rows in this BooleanSelection from `offset` to `offset + len`
+    pub fn slice(&self, offset: usize, len: usize) -> BooleanArray {
+        BooleanArray::new(self.selectors.slice(offset, len), None)
+    }
 }
 
 impl From<Vec<RowSelector>> for BooleanSelection {
