@@ -229,9 +229,9 @@ impl From<RowSelection> for BooleanSelection {
     }
 }
 
-impl From<BooleanSelection> for RowSelection {
-    fn from(selection: BooleanSelection) -> Self {
-        let array = BooleanArray::new(selection.selectors, None);
+impl From<&BooleanSelection> for RowSelection {
+    fn from(selection: &BooleanSelection) -> Self {
+        let array = BooleanArray::new(selection.selectors.clone(), None);
         RowSelection::from_filters(&[array])
     }
 }

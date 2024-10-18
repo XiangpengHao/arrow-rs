@@ -707,9 +707,9 @@ where
                 };
 
                 if cache_selection.selects_any() {
-                    let cached_record_batches = cache.get_record_batches_by_boolean_selection(
+                    let cached_record_batches = cache.get_record_batches_by_filter(
                         row_group_idx,
-                        &cache_selection,
+                        cache_selection.clone(),
                         &predicate_schema,
                         &predicate_column_idx,
                     );
@@ -725,13 +725,13 @@ where
                         &mut self.input,
                         self.fields.as_deref(),
                         predicate.projection(),
-                        &RowSelection::from(parquet_selection.clone()),
+                        &RowSelection::from(&parquet_selection),
                     )
                     .await?;
 
-                    let record_batches = cache.get_record_batches_by_boolean_selection(
+                    let record_batches = cache.get_record_batches_by_filter(
                         row_group_idx,
-                        &parquet_selection,
+                        parquet_selection.clone(),
                         &predicate_schema,
                         &predicate_column_idx,
                     );
@@ -743,7 +743,7 @@ where
             }
         }
 
-        let mut selection = RowSelection::from(selection);
+        let mut selection = RowSelection::from(&selection);
 
         // Compute the number of rows in the selection before applying limit and offset
         let rows_before = selection.row_count();
@@ -778,6 +778,8 @@ where
             *limit -= rows_after;
         }
 
+        let selection = BooleanSelection::from(selection);
+
         let schema = Arc::new(schema_from_projection(
             self.fields.as_deref().unwrap(),
             &projection,
@@ -793,12 +795,12 @@ where
                         .into_iter()
                         .sorted_by_key(|range| range.start)
                         .collect_vec();
-                    let cached_ranges = RowSelection::from_consecutive_ranges(
+                    let cached_ranges = BooleanSelection::from_consecutive_ranges(
                         sorted_ranges.iter().map(|r| r.clone()),
                         row_group.row_count,
                     );
                     let selection_from_cache = selection.intersection(&cached_ranges);
-                    let inverted = selection_from_cache.clone().into_inverted();
+                    let inverted = selection_from_cache.as_inverted();
                     let selection_from_parquet = selection.intersection(&inverted);
                     (selection_from_parquet, Some(selection_from_cache))
                 }
@@ -808,7 +810,7 @@ where
         let cached_record_batch_reader = cached_selection.map(|selection| {
             let record_batches = ArrowArrayCache::get().get_record_batches(
                 row_group_idx,
-                &selection,
+                selection,
                 &schema,
                 &column_ids,
             );
@@ -822,14 +824,14 @@ where
                 &mut self.input,
                 self.fields.as_deref(),
                 &projection,
-                &parquet_selection,
+                &RowSelection::from(&parquet_selection),
             )
             .await?;
 
             // we already have the data in the cache, so we can just read from the cache
             let record_batches = ArrowArrayCache::get().get_record_batches(
                 row_group_idx,
-                &parquet_selection,
+                parquet_selection.clone(),
                 &schema,
                 &column_ids,
             );
