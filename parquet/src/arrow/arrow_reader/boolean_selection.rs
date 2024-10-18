@@ -160,21 +160,25 @@ impl BooleanSelection {
             "The 'other' selection must have exactly as many set bits as 'self'."
         );
 
-        let mut builder = BooleanBufferBuilder::new(self.len());
+        if self.len() == other.len() {
+            // fast path if the two selections are the same length
+            // common if this is the first predicate
+            debug_assert_eq!(self.row_count(), self.len());
+            return self.intersection(other);
+        }
+
+        let mut_buffer = self.selectors.copy_to_mutable();
+        let mut builder = BooleanBufferBuilder::new_from_buffer(mut_buffer, self.len());
 
         // Create iterators for 'self' and 'other' bits
         let mut other_bits = other.selectors.iter();
 
-        for bit in self.selectors.iter() {
-            if bit {
-                // Apply the predicate from 'other'
-                let predicate = other_bits
-                    .next()
-                    .expect("Mismatch in set bits between self and other");
-                builder.append(predicate);
-            } else {
-                // If 'self' bit is not set, the result should also not be set
-                builder.append(false);
+        for bit_idx in self.positive_iter() {
+            let predicate = other_bits
+                .next()
+                .expect("Mismatch in set bits between self and other");
+            if !predicate {
+                builder.set_bit(bit_idx, false);
             }
         }
 

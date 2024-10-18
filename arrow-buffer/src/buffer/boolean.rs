@@ -205,6 +205,14 @@ impl BooleanBuffer {
     pub fn set_slices(&self) -> BitSliceIterator<'_> {
         BitSliceIterator::new(self.values(), self.offset, self.len)
     }
+
+    /// Copy the buffer to a mutable buffer
+    pub fn copy_to_mutable(&self) -> MutableBuffer {
+        debug_assert_eq!(self.offset, 0);
+        let mut buffer = MutableBuffer::from_len_zeroed(self.buffer.len());
+        buffer.copy_from_slice(self.values());
+        buffer.into()
+    }
 }
 
 impl Not for &BooleanBuffer {
