@@ -926,10 +926,15 @@ impl<'a> BooleanSelectionIter<'a> {
         cache: &'a ArrowArrayCache,
         row_group_id: usize,
         selection: BooleanSelection,
-        schema: SchemaRef,
+        mut schema: SchemaRef,
         parquet_column_ids: Vec<usize>,
         batch_size: usize,
     ) -> Self {
+        if parquet_column_ids.is_empty() {
+            let data_type = DataType::Struct(Fields::empty());
+            let fields = vec![Field::new("empty", data_type, false)];
+            schema = Arc::new(Schema::new(fields));
+        }
         Self {
             cache,
             selection,
@@ -960,7 +965,7 @@ impl<'a> Iterator for BooleanSelectionIter<'a> {
             }
 
             let record_batch = if self.parquet_column_ids.is_empty() {
-                make_dummy_record_batch(&self.schema, want_to_select)
+                make_dummy_record_batch(&self.schema, selection.true_count())
             } else {
                 let mut columns = Vec::with_capacity(self.schema.fields().len());
                 for &column_id in &self.parquet_column_ids {
@@ -1087,46 +1092,23 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
 
         // Define various row selections
-        let selections: Vec<(Vec<RowSelector>, Vec<Vec<i32>>)> = vec![
-            (
-                vec![RowSelector::select(42)],
-                vec![(0..32).collect(), (32..42).collect()],
-            ),
-            (
-                vec![RowSelector::select(15), RowSelector::select(10)],
-                vec![(0..25).collect()],
-            ),
-            (
-                vec![
-                    RowSelector::skip(33),
-                    RowSelector::select(5),
-                    RowSelector::select(3),
-                ],
-                vec![(33..41).collect()],
-            ),
-            (
-                vec![RowSelector::skip(16), RowSelector::select(22)],
-                vec![(16..38).collect()],
-            ),
-            (
-                vec![
-                    RowSelector::select(16),
-                    RowSelector::skip(20),
-                    RowSelector::select(4),
-                    RowSelector::select(2),
-                ],
-                vec![(0..16).into_iter().chain(36..42).collect()],
-            ),
-        ];
+        let selections = gen_selections();
 
-        for (selection, expected) in selections.iter() {
+        let expected = vec![vec![32, 10], vec![32], vec![5], vec![24, 4], vec![8, 4]];
+
+        for (selection, expected) in selections.iter().zip(expected) {
             let selection = RowSelection::from(selection.clone());
             let record_batches = cache
-                .get_record_batch_by_take(row_group_id, &selection, &schema, &parquet_column_ids)
+                .get_record_batches_by_filter(
+                    row_group_id,
+                    BooleanSelection::from(selection),
+                    &schema,
+                    &parquet_column_ids,
+                )
                 .collect::<Vec<_>>();
             assert_eq!(record_batches.len(), expected.len());
             for (batch, expected) in record_batches.into_iter().zip(expected) {
-                assert_eq!(batch.num_rows(), expected.len());
+                assert_eq!(batch.num_rows(), expected);
             }
         }
     }
