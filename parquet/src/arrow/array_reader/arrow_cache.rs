@@ -6,7 +6,7 @@ use arrow_select::concat::concat_batches;
 use vortex::arrow::FromArrowArray;
 use vortex::IntoCanonical;
 use vortex_sampling_compressor::compressors::alp::ALPCompressor;
-use vortex_sampling_compressor::compressors::bitpacked::BitPackedCompressor;
+use vortex_sampling_compressor::compressors::bitpacked::BITPACK_WITH_PATCHES;
 use vortex_sampling_compressor::compressors::delta::DeltaCompressor;
 use vortex_sampling_compressor::compressors::dict::DictCompressor;
 use vortex_sampling_compressor::compressors::fsst::FSSTCompressor;
@@ -22,8 +22,8 @@ use arrow_array::types::{
     UInt8Type as ArrowUInt8Type,
 };
 use arrow_array::{
-    ArrayRef, DictionaryArray, RecordBatch, RecordBatchWriter, StringArray, StructArray,
-    UInt32Array, UInt64Array,
+    ArrayRef, BooleanArray, DictionaryArray, RecordBatch, RecordBatchWriter, StringArray,
+    StructArray, UInt32Array, UInt64Array,
 };
 use arrow_ipc::reader::FileReader;
 use arrow_ipc::writer::FileWriter;
@@ -259,11 +259,11 @@ impl ArrowArrayCache {
                 "vortex" => ArrowCacheMode::Vortex(SamplingCompressor::new_with_options(
                     HashSet::from([
                         &ALPCompressor as CompressorRef,
-                        &BitPackedCompressor,
+                        &BITPACK_WITH_PATCHES,
                         &DeltaCompressor,
+                        &FSSTCompressor,
                         &DictCompressor,
                         &FoRCompressor,
-                        &FSSTCompressor,
                     ]),
                     Default::default(),
                 )),
@@ -436,8 +436,12 @@ impl ArrowArrayCache {
         intersected_ranges
     }
 
-    /// Get an arrow array from the cache.
-    pub fn get_arrow_array(&self, id: &ArrayIdentifier) -> Option<ArrayRef> {
+    /// Get an arrow array from the cache with a predicate.
+    pub fn get_arrow_array_with_filter(
+        &self,
+        id: &ArrayIdentifier,
+        filter: Option<&BooleanArray>,
+    ) -> Option<ArrayRef> {
         if matches!(self.cache_mode, ArrowCacheMode::NoCache) {
             return None;
         }
@@ -448,27 +452,59 @@ impl ArrowArrayCache {
         let cached_entry = column_cache.get(&id.row_id)?;
         cached_entry.hit_count.fetch_add(1, Ordering::Relaxed);
         match &cached_entry.value {
-            CachedValue::InMemory(array) => Some(array.clone()),
+            CachedValue::InMemory(array) => match filter {
+                Some(predicate) => Some(arrow_select::filter::filter(array, predicate).unwrap()),
+                None => Some(array.clone()),
+            },
             CachedValue::OnDisk(path) => {
                 let file = std::fs::File::open(path).ok()?;
                 let reader = std::io::BufReader::new(file);
                 let mut arrow_reader = FileReader::try_new(reader, None).ok()?;
                 let batch = arrow_reader.next().unwrap().unwrap();
-                Some(batch.column(0).clone())
+                let array = batch.column(0);
+                match filter {
+                    Some(predicate) => {
+                        Some(arrow_select::filter::filter(array, predicate).unwrap())
+                    }
+                    None => Some(array.clone()),
+                }
             }
-            CachedValue::Vortex(array) => {
-                let array: vortex::Array = (**array).clone();
-                let array = array.into_canonical().unwrap();
-                let canonical_array = array.into_arrow().unwrap();
-                Some(canonical_array)
-            }
+            CachedValue::Vortex(array) => match filter {
+                Some(predicate) => {
+                    let predicate = vortex::Array::from_arrow(predicate, false);
+                    let filtered = vortex::compute::filter(&array, &predicate).unwrap();
+                    let array = filtered.into_canonical().unwrap();
+                    let canonical_array = array.into_arrow().unwrap();
+                    Some(canonical_array)
+                }
+                None => Some(
+                    (**array)
+                        .clone()
+                        .into_canonical()
+                        .unwrap()
+                        .into_arrow()
+                        .unwrap(),
+                ),
+            },
         }
     }
 
-    fn id_exists(&self, id: &ArrayIdentifier) -> bool {
+    /// Get an arrow array from the cache.
+    pub fn get_arrow_array(&self, id: &ArrayIdentifier) -> Option<ArrayRef> {
+        self.get_arrow_array_with_filter(id, None)
+    }
+
+    pub(crate) fn is_cached(&self, id: &ArrayIdentifier) -> bool {
         let cache = &self.value[id.row_group_id].read().unwrap();
         cache.contains_key(&id.column_id)
             && cache.get(&id.column_id).unwrap().contains_key(&id.row_id)
+    }
+
+    pub(crate) fn get_len(&self, id: &ArrayIdentifier) -> Option<usize> {
+        let cache = &self.value[id.row_group_id].read().unwrap();
+        let column_cache = cache.get(&id.column_id)?;
+        let cached_entry = column_cache.get(&id.row_id)?;
+        Some(cached_entry.row_count as usize)
     }
 
     /// Insert an arrow array into the cache.
@@ -477,7 +513,7 @@ impl ArrowArrayCache {
             return;
         }
 
-        if self.id_exists(id) {
+        if self.is_cached(id) {
             return;
         }
 
@@ -970,8 +1006,10 @@ impl<'a> Iterator for BooleanSelectionIter<'a> {
                 let mut columns = Vec::with_capacity(self.schema.fields().len());
                 for &column_id in &self.parquet_column_ids {
                     let id = ArrayIdentifier::new(self.row_group_id, column_id, self.cur_row_id);
-                    let mut array = self.cache.get_arrow_array(&id).unwrap();
-                    array = arrow_select::filter::filter(&array, &selection).unwrap();
+                    let array = self
+                        .cache
+                        .get_arrow_array_with_filter(&id, Some(&selection))
+                        .unwrap();
                     columns.push(array);
                 }
                 RecordBatch::try_new(self.schema.clone(), columns).unwrap()

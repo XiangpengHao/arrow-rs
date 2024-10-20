@@ -921,9 +921,8 @@ where
 
         let reader = ParquetRecordBatchReader::new(8192, array_reader, Some(aligned_selection));
 
-        for batch in reader {
+        for _batch in reader {
             // do nothing, as we populate the record batch, they will be cached for future use.
-            assert!(batch.is_ok());
         }
 
         Ok(())

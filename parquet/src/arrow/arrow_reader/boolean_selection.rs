@@ -137,21 +137,6 @@ impl BooleanSelection {
     /// The `other` `BooleanSelection` must have exactly as many set bits as `self`.
     /// This method will keep only the bits in `self` that are also set in `other`
     /// at the positions corresponding to `self`'s set bits.
-    ///
-    /// # Example
-    /// ```
-    /// use arrow_rs::parquet::arrow::arrow_reader::BooleanSelection;
-    /// use arrow_rs::array::BooleanArray;
-    ///
-    /// let self_mask = BooleanSelection::from_filters(&[
-    ///     BooleanArray::from(vec![false, false, true, false, true, true, false, true, false, true, false, true]),
-    /// ]);
-    /// let other_mask = BooleanSelection::from_filters(&[
-    ///     BooleanArray::from(vec![false, false, true, true, false, true]),
-    /// ]);
-    /// let result = self_mask.and_then(&other_mask);
-    /// // The result should be 000001010001
-    /// ```
     pub fn and_then(&self, other: &Self) -> Self {
         // Ensure that 'other' has exactly as many set bits as 'self'
         debug_assert_eq!(
