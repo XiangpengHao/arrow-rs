@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::any::Any;
-use std::sync::Arc;
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Fields, SchemaBuilder};
+use std::any::Any;
+use std::sync::Arc;
 
 use crate::arrow::array_reader::byte_view_array::make_byte_view_array_reader;
 use crate::arrow::array_reader::empty_array::make_empty_array_reader;
@@ -46,7 +46,7 @@ struct CachedArrayReader {
 }
 
 enum BufferValueType {
-    Cached(ArrayRef),
+    Cached(usize),
     Parquet,
 }
 
@@ -73,19 +73,12 @@ impl ArrayReader for CachedArrayReader {
 
     fn read_records(&mut self, request_size: usize) -> Result<usize> {
         let row_batch_id = self.current_row_id / 8192 * 8192;
-        let offset = self.current_row_id - row_batch_id;
         let batch_id = ArrayIdentifier::new(self.row_group_id, self.column_id, row_batch_id);
-        if let Some(mut cached_array) = ArrowArrayCache::get().get_arrow_array(&batch_id) {
-            let cached_size = cached_array.len();
+        if let Some(cached_size) = ArrowArrayCache::get().get_len(&batch_id) {
             if (self.current_row_id + request_size) <= (row_batch_id + cached_size) {
-                if cached_size > request_size {
-                    // this means we have row selection, so we need to split the cached array
-                    cached_array = cached_array.slice(offset, request_size);
-                }
-
-                let to_skip = cached_array.len();
+                let to_skip = request_size;
                 self.current_cached
-                    .push(BufferValueType::Cached(cached_array));
+                    .push(BufferValueType::Cached(request_size));
 
                 let skipped = self.inner.skip_records(to_skip).unwrap();
                 assert_eq!(skipped, to_skip);
@@ -101,21 +94,20 @@ impl ArrayReader for CachedArrayReader {
     }
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {
-        let mut final_array = vec![];
         let mut parquet_count = 0;
+        let mut cached_rows = 0;
         for value in self.current_cached.iter() {
             match value {
-                BufferValueType::Cached(array) => {
-                    final_array.push(array.as_ref());
+                BufferValueType::Cached(rows) => {
+                    cached_rows += rows;
                 }
                 BufferValueType::Parquet => parquet_count += 1,
             }
         }
 
         let parquet_records = self.inner.consume_batch().unwrap();
-        final_array.push(parquet_records.as_ref());
 
-        if parquet_records.len() > 0 && final_array.len() == 1 && parquet_count == 1 {
+        if parquet_records.len() > 0 && cached_rows == 0 && parquet_count == 1 {
             let row_id = self.current_row_id - parquet_records.len();
             let row_batch_id = row_id / 8192 * 8192;
 
@@ -125,10 +117,9 @@ impl ArrayReader for CachedArrayReader {
             ArrowArrayCache::get().insert_arrow_array(&batch_id, parquet_records.clone());
         }
 
-        let final_array = arrow_select::concat::concat(&final_array).unwrap();
         self.current_cached.clear();
 
-        Ok(final_array)
+        Ok(parquet_records)
     }
 
     fn skip_records(&mut self, num_records: usize) -> Result<usize> {
