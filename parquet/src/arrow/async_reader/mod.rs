@@ -707,14 +707,13 @@ where
                 };
 
                 if cache_selection.selects_any() {
-                    let cached_record_batches = cache.get_record_batches_by_filter(
+                    cache_selection = Self::evaluate_predicate(
                         row_group_idx,
-                        cache_selection.clone(),
+                        &cache_selection,
                         &predicate_schema,
                         &predicate_column_idx,
-                    );
-                    cache_selection = cache_selection
-                        .and_then(&Self::evaluate_predicate(cached_record_batches, predicate)?);
+                        predicate,
+                    )?;
                 }
 
                 if parquet_selection.selects_any() {
@@ -728,15 +727,13 @@ where
                         &RowSelection::from(&parquet_selection),
                     )
                     .await?;
-
-                    let record_batches = cache.get_record_batches_by_filter(
+                    parquet_selection = Self::evaluate_predicate(
                         row_group_idx,
-                        parquet_selection.clone(),
+                        &parquet_selection,
                         &predicate_schema,
                         &predicate_column_idx,
-                    );
-                    parquet_selection = parquet_selection
-                        .and_then(&Self::evaluate_predicate(record_batches, predicate)?);
+                        predicate,
+                    )?;
                 }
 
                 selection = cache_selection.union(&parquet_selection);
@@ -873,28 +870,51 @@ where
     }
 
     fn evaluate_predicate(
-        record_batches: impl IntoIterator<Item = RecordBatch>,
+        row_group_id: usize,
+        selection: &BooleanSelection,
+        schema: &SchemaRef,
+        parquet_column_ids: &[usize],
         predicate: &mut Box<dyn ArrowPredicate>,
     ) -> Result<BooleanSelection> {
         let mut filters = vec![];
-        for maybe_batch in record_batches {
-            let input_rows = maybe_batch.num_rows();
-            let filter = predicate.evaluate(maybe_batch)?;
-            // Since user supplied predicate, check error here to catch bugs quickly
-            if filter.len() != input_rows {
-                return Err(arrow_err!(
-                    "ArrowPredicate predicate returned {} rows, expected {input_rows}",
-                    filter.len()
-                ));
+        if parquet_column_ids.len() == 1 {
+            let parquet_column_id = parquet_column_ids[0];
+            let iter = ArrowArrayCache::get().get_record_batches_by_selection_with_predicate(
+                row_group_id,
+                &selection,
+                schema,
+                parquet_column_id,
+                predicate,
+            );
+            for filter in iter {
+                filters.push(filter);
             }
-            match filter.null_count() {
-                0 => filters.push(filter),
-                _ => filters.push(prep_null_mask_filter(&filter)),
-            };
+        } else {
+            let cached_record_batches = ArrowArrayCache::get().get_record_batches_by_filter(
+                row_group_id,
+                selection.clone(),
+                schema,
+                parquet_column_ids,
+            );
+            for maybe_batch in cached_record_batches {
+                let input_rows = maybe_batch.num_rows();
+                let filter = predicate.evaluate(maybe_batch)?;
+                // Since user supplied predicate, check error here to catch bugs quickly
+                if filter.len() != input_rows {
+                    return Err(arrow_err!(
+                        "ArrowPredicate predicate returned {} rows, expected {input_rows}",
+                        filter.len()
+                    ));
+                }
+                match filter.null_count() {
+                    0 => filters.push(filter),
+                    _ => filters.push(prep_null_mask_filter(&filter)),
+                };
+            }
         }
-
         let raw = BooleanSelection::from_filters(&filters);
-        Ok(raw)
+        let selection = selection.and_then(&raw);
+        Ok(selection)
     }
 
     async fn fetch_and_cache_row_group<'a>(

@@ -1,4 +1,4 @@
-use crate::arrow::arrow_reader::{BooleanSelection, RowSelection, RowSelector};
+use crate::arrow::arrow_reader::{ArrowPredicate, BooleanSelection, RowSelection, RowSelector};
 use ahash::AHashMap;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
@@ -328,13 +328,13 @@ impl ArrowArrayCache {
     }
 
     /// Get a record batch iterator from a boolean selection.
-    pub fn get_record_batches_by_filter(
-        &self,
+    pub fn get_record_batches_by_filter<'a>(
+        &'a self,
         row_group_id: usize,
         selection: BooleanSelection,
         schema: &SchemaRef,
         parquet_column_ids: &[usize],
-    ) -> BooleanSelectionIter {
+    ) -> BooleanSelectionIter<'a> {
         BooleanSelectionIter::new(
             self,
             row_group_id,
@@ -342,6 +342,26 @@ impl ArrowArrayCache {
             schema.clone(),
             parquet_column_ids.to_vec(),
             self.batch_size,
+        )
+    }
+
+    /// Get a record batch iterator from a boolean selection with a predicate.
+    pub fn get_record_batches_by_selection_with_predicate<'a, 'b>(
+        &'a self,
+        row_group_id: usize,
+        selection: &'b BooleanSelection,
+        schema: &SchemaRef,
+        parquet_column_id: usize,
+        predicate: &'b mut Box<dyn ArrowPredicate>,
+    ) -> BooleanSelectionPredicateIter<'a, 'b> {
+        BooleanSelectionPredicateIter::new(
+            self,
+            row_group_id,
+            selection,
+            schema.clone(),
+            parquet_column_id,
+            self.batch_size,
+            predicate,
         )
     }
 
@@ -436,11 +456,64 @@ impl ArrowArrayCache {
         intersected_ranges
     }
 
-    /// Get an arrow array from the cache with a predicate.
-    pub fn get_arrow_array_with_filter(
+    /// Get an arrow array from the cache with a selection.
+    pub fn get_arrow_array_with_selection_and_predicate(
         &self,
         id: &ArrayIdentifier,
-        filter: Option<&BooleanArray>,
+        selection: Option<&BooleanArray>,
+        predicate: &mut Box<dyn ArrowPredicate>,
+        schema: &SchemaRef,
+    ) -> Option<BooleanArray> {
+        if matches!(self.cache_mode, ArrowCacheMode::NoCache) {
+            return None;
+        }
+
+        let cache = &self.value[id.row_group_id].read().unwrap();
+
+        let column_cache = cache.get(&id.column_id)?;
+        let cached_entry = column_cache.get(&id.row_id)?;
+        cached_entry.hit_count.fetch_add(1, Ordering::Relaxed);
+        match &cached_entry.value {
+            CachedValue::InMemory(array) => {
+                let array = match selection {
+                    Some(selection) => arrow_select::filter::filter(array, selection).unwrap(),
+                    None => array.clone(),
+                };
+                let record_batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+                let array = predicate.evaluate(record_batch).unwrap();
+                Some(array)
+            }
+            CachedValue::OnDisk(path) => {
+                let file = std::fs::File::open(path).ok()?;
+                let reader = std::io::BufReader::new(file);
+                let mut arrow_reader = FileReader::try_new(reader, None).ok()?;
+                let batch = arrow_reader.next().unwrap().unwrap();
+                let batch = match selection {
+                    Some(selection) => {
+                        arrow_select::filter::filter_record_batch(&batch, selection).unwrap()
+                    }
+                    None => batch,
+                };
+                let array = predicate.evaluate(batch).unwrap();
+                Some(array)
+            }
+            CachedValue::Vortex(array) => match selection {
+                Some(selection) => {
+                    let selection = vortex::Array::from_arrow(selection, false);
+                    let filtered = vortex::compute::filter(&array, &selection).unwrap();
+                    let array = predicate.evaluate_any(&filtered).unwrap();
+                    Some(array)
+                }
+                None => Some(predicate.evaluate_any(array).unwrap()),
+            },
+        }
+    }
+
+    /// Get an arrow array from the cache with a selection.
+    pub fn get_arrow_array_with_selection(
+        &self,
+        id: &ArrayIdentifier,
+        selection: Option<&BooleanArray>,
     ) -> Option<ArrayRef> {
         if matches!(self.cache_mode, ArrowCacheMode::NoCache) {
             return None;
@@ -452,8 +525,8 @@ impl ArrowArrayCache {
         let cached_entry = column_cache.get(&id.row_id)?;
         cached_entry.hit_count.fetch_add(1, Ordering::Relaxed);
         match &cached_entry.value {
-            CachedValue::InMemory(array) => match filter {
-                Some(predicate) => Some(arrow_select::filter::filter(array, predicate).unwrap()),
+            CachedValue::InMemory(array) => match selection {
+                Some(selection) => Some(arrow_select::filter::filter(array, selection).unwrap()),
                 None => Some(array.clone()),
             },
             CachedValue::OnDisk(path) => {
@@ -462,19 +535,28 @@ impl ArrowArrayCache {
                 let mut arrow_reader = FileReader::try_new(reader, None).ok()?;
                 let batch = arrow_reader.next().unwrap().unwrap();
                 let array = batch.column(0);
-                match filter {
-                    Some(predicate) => {
-                        Some(arrow_select::filter::filter(array, predicate).unwrap())
+                match selection {
+                    Some(selection) => {
+                        Some(arrow_select::filter::filter(array, selection).unwrap())
                     }
                     None => Some(array.clone()),
                 }
             }
-            CachedValue::Vortex(array) => match filter {
-                Some(predicate) => {
-                    let predicate = vortex::Array::from_arrow(predicate, false);
+            CachedValue::Vortex(array) => match selection {
+                Some(selection) => {
+                    let predicate = vortex::Array::from_arrow(selection, false);
                     let filtered = vortex::compute::filter(&array, &predicate).unwrap();
                     let array = filtered.into_canonical().unwrap();
                     let canonical_array = array.into_arrow().unwrap();
+
+                    // let canonical_array = (**array)
+                    //     .clone()
+                    //     .into_canonical()
+                    //     .unwrap()
+                    //     .into_arrow()
+                    //     .unwrap();
+                    // let canonical_array =
+                    //     arrow_select::filter::filter(&canonical_array, selection).unwrap();
                     Some(canonical_array)
                 }
                 None => Some(
@@ -491,7 +573,7 @@ impl ArrowArrayCache {
 
     /// Get an arrow array from the cache.
     pub fn get_arrow_array(&self, id: &ArrayIdentifier) -> Option<ArrayRef> {
-        self.get_arrow_array_with_filter(id, None)
+        self.get_arrow_array_with_selection(id, None)
     }
 
     pub(crate) fn is_cached(&self, id: &ArrayIdentifier) -> bool {
@@ -1008,7 +1090,7 @@ impl<'a> Iterator for BooleanSelectionIter<'a> {
                     let id = ArrayIdentifier::new(self.row_group_id, column_id, self.cur_row_id);
                     let array = self
                         .cache
-                        .get_arrow_array_with_filter(&id, Some(&selection))
+                        .get_arrow_array_with_selection(&id, Some(&selection))
                         .unwrap();
                     columns.push(array);
                 }
@@ -1017,6 +1099,76 @@ impl<'a> Iterator for BooleanSelectionIter<'a> {
 
             self.cur_row_id += want_to_select;
             return Some(record_batch);
+        }
+
+        None
+    }
+}
+
+/// BooleanSelectionIter is an iterator that yields record batches based on a boolean selection.
+pub struct BooleanSelectionPredicateIter<'a, 'b: 'a> {
+    cache: &'a ArrowArrayCache,
+    selection: &'b BooleanSelection,
+    row_group_id: usize,
+    schema: SchemaRef,
+    parquet_column_id: usize,
+    batch_size: usize,
+    cur_row_id: usize,
+    predicate: &'b mut Box<dyn ArrowPredicate>,
+}
+
+impl<'a, 'b> BooleanSelectionPredicateIter<'a, 'b> {
+    fn new(
+        cache: &'a ArrowArrayCache,
+        row_group_id: usize,
+        selection: &'b BooleanSelection,
+        schema: SchemaRef,
+        parquet_column_id: usize,
+        batch_size: usize,
+        predicate: &'b mut Box<dyn ArrowPredicate>,
+    ) -> Self {
+        Self {
+            cache,
+            selection,
+            row_group_id,
+            schema,
+            parquet_column_id,
+            batch_size,
+            cur_row_id: 0,
+            predicate,
+        }
+    }
+}
+
+impl<'a, 'b> Iterator for BooleanSelectionPredicateIter<'a, 'b> {
+    type Item = BooleanArray;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.cur_row_id < self.selection.len() {
+            let want_to_select = self.batch_size.min(self.selection.len() - self.cur_row_id);
+            let selection = self.selection.slice(self.cur_row_id, want_to_select);
+            if selection.true_count() == 0 {
+                // no rows are selected, skip this batch
+                self.cur_row_id += want_to_select;
+                continue;
+            }
+
+            let id =
+                ArrayIdentifier::new(self.row_group_id, self.parquet_column_id, self.cur_row_id);
+            let filter = self
+                .cache
+                .get_arrow_array_with_selection_and_predicate(
+                    &id,
+                    Some(&selection),
+                    self.predicate,
+                    &self.schema,
+                )
+                .unwrap();
+            // let record_batch = RecordBatch::try_new(self.schema.clone(), vec![array]).unwrap();
+            // let filter = self.predicate.evaluate(record_batch).unwrap();
+
+            self.cur_row_id += want_to_select;
+            return Some(filter);
         }
 
         None

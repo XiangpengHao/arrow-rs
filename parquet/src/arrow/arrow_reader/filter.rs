@@ -36,6 +36,11 @@ pub trait ArrowPredicate: Send + 'static {
     /// * `true`:the row should be returned
     /// * `false` or `null`: the row should not be returned
     fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError>;
+
+    /// Evaluate the predicate on any type that implements [`Any`]
+    fn evaluate_any(&mut self, _input: &dyn std::any::Any) -> Result<BooleanArray, ArrowError> {
+        unimplemented!()
+    }
 }
 
 /// An [`ArrowPredicate`] created from an [`FnMut`]
