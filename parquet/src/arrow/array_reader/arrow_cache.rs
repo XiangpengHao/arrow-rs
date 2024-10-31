@@ -11,7 +11,7 @@ use vortex_sampling_compressor::compressors::delta::DeltaCompressor;
 use vortex_sampling_compressor::compressors::dict::DictCompressor;
 use vortex_sampling_compressor::compressors::fsst::FSSTCompressor;
 use vortex_sampling_compressor::compressors::r#for::FoRCompressor;
-use vortex_sampling_compressor::compressors::CompressorRef;
+use vortex_sampling_compressor::compressors::{CompressionTree, CompressorRef};
 use vortex_sampling_compressor::SamplingCompressor;
 
 use arrow_array::cast::AsArray;
@@ -41,12 +41,61 @@ type RowMapping = AHashMap<usize, CachedEntry>;
 /// Column offset -> RowMapping
 type ColumnMapping = AHashMap<usize, RowMapping>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum ArrowCacheMode {
     InMemory,
     OnDisk,
     NoCache,
-    Vortex(SamplingCompressor<'static>),
+    Vortex(CompressorStates),
+}
+
+#[derive(Debug)]
+struct CompressorStates {
+    compressor: SamplingCompressor<'static>,
+    compress_tree: RwLock<AHashMap<(usize, usize), CompressionTree<'static>>>,
+}
+
+impl CompressorStates {
+    fn new() -> Self {
+        let compressor = SamplingCompressor::new_with_options(
+            HashSet::from([
+                &ALPCompressor as CompressorRef,
+                &BITPACK_WITH_PATCHES,
+                &DeltaCompressor,
+                &FSSTCompressor,
+                &DictCompressor,
+                &FoRCompressor,
+            ]),
+            Default::default(),
+        );
+        Self {
+            compressor,
+            compress_tree: RwLock::new(AHashMap::new()),
+        }
+    }
+
+    fn compress(
+        &self,
+        array: &vortex::Array,
+        row_group_id: usize,
+        column_id: usize,
+    ) -> Arc<vortex::Array> {
+        let state_lock = self.compress_tree.read().unwrap();
+
+        if let Some(tree) = state_lock.get(&(row_group_id, column_id)) {
+            let compressed = self.compressor.compress(array, Some(tree)).unwrap();
+            return Arc::new(compressed.into_array());
+        }
+        drop(state_lock);
+
+        let compressed = self.compressor.compress(array, None).unwrap();
+        let (array, tree) = compressed.into_parts();
+        if let Some(tree) = tree {
+            let mut state_lock = self.compress_tree.write().unwrap();
+            state_lock.insert((row_group_id, column_id), tree);
+        }
+        Arc::new(array)
+    }
 }
 
 struct CachedEntry {
@@ -256,17 +305,7 @@ impl ArrowArrayCache {
                 "disk" => ArrowCacheMode::OnDisk,
                 "inmemory" => ArrowCacheMode::InMemory,
                 "nocache" => ArrowCacheMode::NoCache,
-                "vortex" => ArrowCacheMode::Vortex(SamplingCompressor::new_with_options(
-                    HashSet::from([
-                        &ALPCompressor as CompressorRef,
-                        &BITPACK_WITH_PATCHES,
-                        &DeltaCompressor,
-                        &FSSTCompressor,
-                        &DictCompressor,
-                        &FoRCompressor,
-                    ]),
-                    Default::default(),
-                )),
+                "vortex" => ArrowCacheMode::Vortex(CompressorStates::new()),
                 _ => panic!(
                     "Invalid cache mode: {}, must be one of [disk, inmemory, nocache, vortex]",
                     v
@@ -638,7 +677,9 @@ impl ArrowArrayCache {
                     return;
                 }
 
-                let vortex_array = match data_type {
+                drop(cache); // blocking call below, release the lock
+
+                let uncompressed = match data_type {
                     DataType::Date32 => {
                         let primitive_array = array.as_primitive::<ArrowDate32Type>();
                         vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
@@ -688,17 +729,11 @@ impl ArrowArrayCache {
                     }
                 };
 
-                match compressor.compress(&vortex_array, None) {
-                    Ok(compressed) => {
-                        column_cache.insert(
-                            id.row_id,
-                            CachedEntry::vortex(Arc::new(compressed.into_array())),
-                        );
-                    }
-                    Err(_e) => {
-                        column_cache.insert(id.row_id, CachedEntry::in_memory(array));
-                    }
-                }
+                let compressed = compressor.compress(&uncompressed, id.row_group_id, id.column_id);
+
+                let mut cache = self.value[id.row_group_id].write().unwrap();
+                let column_cache = cache.entry(id.column_id).or_insert_with(AHashMap::new);
+                column_cache.insert(id.row_id, CachedEntry::vortex(compressed));
             }
 
             ArrowCacheMode::NoCache => {
