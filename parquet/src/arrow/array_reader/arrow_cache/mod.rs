@@ -3,6 +3,7 @@ use ahash::AHashMap;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use arrow_select::concat::concat_batches;
+use utils::RangedFile;
 use vortex::arrow::FromArrowArray;
 use vortex::IntoCanonical;
 use vortex_sampling_compressor::compressors::alp::ALPCompressor;
@@ -13,6 +14,8 @@ use vortex_sampling_compressor::compressors::fsst::FSSTCompressor;
 use vortex_sampling_compressor::compressors::r#for::FoRCompressor;
 use vortex_sampling_compressor::compressors::{CompressionTree, CompressorRef};
 use vortex_sampling_compressor::SamplingCompressor;
+
+mod utils;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
@@ -28,18 +31,22 @@ use arrow_array::{
 use arrow_ipc::reader::FileReader;
 use arrow_ipc::writer::FileWriter;
 use std::collections::{HashSet, VecDeque};
+use std::fmt::Display;
+use std::io::Seek;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock, RwLockReadGuard};
 
 static ARROW_ARRAY_CACHE: LazyLock<ArrowArrayCache> =
     LazyLock::new(|| ArrowArrayCache::initialize_from_env());
 
+static ARROW_DISK_CACHE_PATH: &str = "target/arrow_disk_cache.etc";
+
 /// Row offset -> (Arrow Array, hit count)
-type RowMapping = AHashMap<usize, CachedEntry>;
+type Rows = AHashMap<usize, CachedEntry>;
 
 /// Column offset -> RowMapping
-type ColumnMapping = AHashMap<usize, RowMapping>;
+type Columns = AHashMap<usize, Rows>;
 
 #[derive(Debug)]
 enum ArrowCacheMode {
@@ -98,55 +105,123 @@ impl CompressorStates {
     }
 }
 
-struct CachedEntry {
+struct CachedEntryInner {
     value: CachedValue,
     row_count: u32,
     hit_count: AtomicU32,
 }
 
+impl CachedEntryInner {
+    fn new(value: CachedValue, row_count: u32) -> Self {
+        Self {
+            value,
+            row_count,
+            hit_count: AtomicU32::new(0),
+        }
+    }
+}
+
+struct CachedEntry {
+    inner: RwLock<CachedEntryInner>,
+}
+
 impl CachedEntry {
-    fn in_memory(array: ArrayRef) -> Self {
+    fn row_count(&self) -> u32 {
+        self.inner.read().unwrap().row_count
+    }
+
+    fn increment_hit_count(&self) {
+        self.inner
+            .read()
+            .unwrap()
+            .hit_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    fn convert_to(&self, to: ArrowCacheMode) {
+        let mut inner = self.inner.write().unwrap();
+        inner.value.convert_to(to);
+    }
+
+    fn value(&self) -> RwLockReadGuard<'_, CachedEntryInner> {
+        self.inner.read().unwrap()
+    }
+
+    fn new_in_memory(array: ArrayRef) -> Self {
         let len = array.len();
-        let val = CachedValue::InMemory(array);
+        let val = CachedValue::ArrowMemory(array);
         CachedEntry {
-            value: val,
-            row_count: len as u32,
-            hit_count: AtomicU32::new(0),
+            inner: RwLock::new(CachedEntryInner::new(val, len as u32)),
         }
     }
 
-    fn on_disk(path: String, row_count: usize) -> Self {
-        let val = CachedValue::OnDisk(path);
+    fn new(value: CachedValue, row_count: usize) -> Self {
         CachedEntry {
-            value: val,
-            row_count: row_count as u32,
-            hit_count: AtomicU32::new(0),
+            inner: RwLock::new(CachedEntryInner::new(value, row_count as u32)),
         }
     }
 
-    fn vortex(array: Arc<vortex::Array>) -> Self {
+    fn new_vortex(array: Arc<vortex::Array>) -> Self {
         let len = array.len();
         let val = CachedValue::Vortex(array);
         CachedEntry {
-            value: val,
-            row_count: len as u32,
-            hit_count: AtomicU32::new(0),
+            inner: RwLock::new(CachedEntryInner::new(val, len as u32)),
         }
     }
 }
 
 enum CachedValue {
-    InMemory(ArrayRef),
+    ArrowMemory(ArrayRef),
     Vortex(Arc<vortex::Array>),
-    OnDisk(String),
+    ArrowDisk(Range<u64>),
 }
 
 impl CachedValue {
     fn memory_usage(&self) -> usize {
         match self {
-            Self::InMemory(array) => array.get_array_memory_size(),
-            Self::OnDisk(_) => 0,
+            Self::ArrowMemory(array) => array.get_array_memory_size(),
+            Self::ArrowDisk(_) => 0,
             Self::Vortex(array) => array.nbytes(),
+        }
+    }
+
+    fn convert_to(&mut self, to: ArrowCacheMode) {
+        match (&self, &to) {
+            (Self::ArrowMemory(v), ArrowCacheMode::OnDisk) => {
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(ARROW_DISK_CACHE_PATH)
+                    .unwrap();
+
+                let start_pos = file.stream_position().unwrap();
+                let mut writer = std::io::BufWriter::new(file);
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    "_",
+                    v.data_type().clone(),
+                    v.is_nullable(),
+                )]));
+                let mut arrow_writer = FileWriter::try_new(&mut writer, &schema).unwrap();
+                let record_batch = RecordBatch::try_new(schema, vec![v.clone()]).unwrap();
+                arrow_writer.write(&record_batch).unwrap();
+                arrow_writer.close().unwrap();
+
+                let mut file = writer.into_inner().unwrap();
+                let end_pos = file.stream_position().unwrap();
+                *self = CachedValue::ArrowDisk(start_pos..end_pos);
+            }
+            _ => unimplemented!("convert {} to {:?} not implemented", self, to),
+        }
+    }
+}
+
+impl Display for CachedValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ArrowMemory(_) => write!(f, "ArrowMemory"),
+            Self::Vortex(_) => write!(f, "Vortex"),
+            Self::ArrowDisk(_) => write!(f, "ArrowDisk"),
         }
     }
 }
@@ -293,7 +368,7 @@ pub enum CacheType {
 /// ArrowArrayCache is used to cache arrow arrays in memory, on disk, or in a vortex.
 pub struct ArrowArrayCache {
     /// Vec of RwLocks, where index is the row group index and value is the ColumnMapping
-    value: Vec<RwLock<ColumnMapping>>,
+    value: Vec<RwLock<Columns>>,
     cache_mode: ArrowCacheMode,
     batch_size: usize,
 }
@@ -321,7 +396,7 @@ impl ArrowArrayCache {
         const MAX_ROW_GROUPS: usize = 512;
         ArrowArrayCache {
             value: (0..MAX_ROW_GROUPS)
-                .map(|_| RwLock::new(ColumnMapping::new()))
+                .map(|_| RwLock::new(Columns::new()))
                 .collect(),
             cache_mode,
             batch_size,
@@ -359,7 +434,7 @@ impl ArrowArrayCache {
         let mut result_ranges = HashSet::new();
         for (row_id, cached_entry) in rows.iter() {
             let start = *row_id;
-            let end = row_id + cached_entry.row_count as usize;
+            let end = row_id + cached_entry.row_count() as usize;
 
             result_ranges.insert(start..end);
         }
@@ -511,9 +586,10 @@ impl ArrowArrayCache {
 
         let column_cache = cache.get(&id.column_id)?;
         let cached_entry = column_cache.get(&id.row_id)?;
-        cached_entry.hit_count.fetch_add(1, Ordering::Relaxed);
+        cached_entry.increment_hit_count();
+        let cached_entry = cached_entry.value();
         match &cached_entry.value {
-            CachedValue::InMemory(array) => {
+            CachedValue::ArrowMemory(array) => {
                 let array = match selection {
                     Some(selection) => arrow_select::filter::filter(array, selection).unwrap(),
                     None => array.clone(),
@@ -522,9 +598,12 @@ impl ArrowArrayCache {
                 let array = predicate.evaluate(record_batch).unwrap();
                 Some(array)
             }
-            CachedValue::OnDisk(path) => {
-                let file = std::fs::File::open(path).ok()?;
+            CachedValue::ArrowDisk(range) => {
+                let mut file = std::fs::File::open(ARROW_DISK_CACHE_PATH).ok()?;
+                file.seek(std::io::SeekFrom::Start(range.start)).unwrap();
+                // let ranged_reader = file.take(range.end - range.start);
                 let reader = std::io::BufReader::new(file);
+
                 let mut arrow_reader = FileReader::try_new(reader, None).ok()?;
                 let batch = arrow_reader.next().unwrap().unwrap();
                 let batch = match selection {
@@ -562,15 +641,18 @@ impl ArrowArrayCache {
 
         let column_cache = cache.get(&id.column_id)?;
         let cached_entry = column_cache.get(&id.row_id)?;
-        cached_entry.hit_count.fetch_add(1, Ordering::Relaxed);
+        cached_entry.increment_hit_count();
+        let cached_entry = cached_entry.value();
         match &cached_entry.value {
-            CachedValue::InMemory(array) => match selection {
+            CachedValue::ArrowMemory(array) => match selection {
                 Some(selection) => Some(arrow_select::filter::filter(array, selection).unwrap()),
                 None => Some(array.clone()),
             },
-            CachedValue::OnDisk(path) => {
-                let file = std::fs::File::open(path).ok()?;
-                let reader = std::io::BufReader::new(file);
+            CachedValue::ArrowDisk(range) => {
+                let file = std::fs::File::open(ARROW_DISK_CACHE_PATH).ok()?;
+                let ranged_file = RangedFile::new(file, range.clone()).ok()?;
+
+                let reader = std::io::BufReader::new(ranged_file);
                 let mut arrow_reader = FileReader::try_new(reader, None).ok()?;
                 let batch = arrow_reader.next().unwrap().unwrap();
                 let array = batch.column(0);
@@ -625,7 +707,7 @@ impl ArrowArrayCache {
         let cache = &self.value[id.row_group_id].read().unwrap();
         let column_cache = cache.get(&id.column_id)?;
         let cached_entry = column_cache.get(&id.row_id)?;
-        Some(cached_entry.row_count as usize)
+        Some(cached_entry.row_count() as usize)
     }
 
     /// Insert an arrow array into the cache.
@@ -644,36 +726,22 @@ impl ArrowArrayCache {
 
         match &self.cache_mode {
             ArrowCacheMode::InMemory => {
-                let old = column_cache.insert(id.row_id, CachedEntry::in_memory(array));
+                let old = column_cache.insert(id.row_id, CachedEntry::new_in_memory(array));
                 assert!(old.is_none());
             }
             ArrowCacheMode::OnDisk => {
-                let path = format!(
-                    "target/arrow-cache/arrow_array_{}_{}_{}.arrow",
-                    id.row_group_id, id.column_id, id.row_id
-                );
-                std::fs::create_dir_all("target/arrow-cache").unwrap();
-                let file = std::fs::File::create(path.clone()).unwrap();
-                let mut writer = std::io::BufWriter::new(file);
-                let schema = Schema::new(vec![Field::new(
-                    "_",
-                    array.data_type().clone(),
-                    array.is_nullable(),
-                )]);
-                let array_len = array.len();
-                let record_batch =
-                    RecordBatch::try_new(Arc::new(schema.clone()), vec![array]).unwrap();
-                let mut arrow_writer = FileWriter::try_new(&mut writer, &schema).unwrap();
-                arrow_writer.write(&record_batch).unwrap();
-                arrow_writer.close().unwrap();
-                column_cache.insert(id.row_id, CachedEntry::on_disk(path, array_len));
+                let row_count = array.len();
+                let mut cached_value = CachedValue::ArrowMemory(array);
+                cached_value.convert_to(ArrowCacheMode::OnDisk);
+
+                column_cache.insert(id.row_id, CachedEntry::new(cached_value, row_count));
             }
             ArrowCacheMode::Vortex(compressor) => {
                 let data_type = array.data_type();
 
                 if array.len() < self.batch_size {
                     // our batch is too small.
-                    column_cache.insert(id.row_id, CachedEntry::in_memory(array));
+                    column_cache.insert(id.row_id, CachedEntry::new_in_memory(array));
                     return;
                 }
 
@@ -724,6 +792,10 @@ impl ArrowArrayCache {
                         let string_array = array.as_string::<i32>();
                         vortex::Array::from_arrow(string_array, array.logical_nulls().is_some())
                     }
+                    DataType::Utf8View => {
+                        let string_array = array.as_string_view();
+                        vortex::Array::from_arrow(string_array, array.logical_nulls().is_some())
+                    }
                     _ => {
                         unimplemented!("data type {:?} not implemented", data_type);
                     }
@@ -733,7 +805,7 @@ impl ArrowArrayCache {
 
                 let mut cache = self.value[id.row_group_id].write().unwrap();
                 let column_cache = cache.entry(id.column_id).or_insert_with(AHashMap::new);
-                column_cache.insert(id.row_id, CachedEntry::vortex(compressed));
+                column_cache.insert(id.row_id, CachedEntry::new_vortex(compressed));
             }
 
             ArrowCacheMode::NoCache => {
@@ -751,16 +823,17 @@ impl ArrowArrayCache {
 
             for (column_id, row_mapping) in row_group.iter() {
                 for (row_start_id, cached_entry) in row_mapping {
-                    let cache_type = match cached_entry.value {
-                        CachedValue::InMemory(_) => CacheType::InMemory,
-                        CachedValue::OnDisk(_) => CacheType::OnDisk,
+                    let cached_entry = cached_entry.value();
+                    let cache_type = match &cached_entry.value {
+                        CachedValue::ArrowMemory(_) => CacheType::InMemory,
+                        CachedValue::ArrowDisk(_) => CacheType::OnDisk,
                         CachedValue::Vortex(_) => CacheType::Vortex,
                     };
 
                     let memory_size = cached_entry.value.memory_usage();
                     let row_count = match &cached_entry.value {
-                        CachedValue::InMemory(array) => array.len(),
-                        CachedValue::OnDisk(_) => 0, // We don't know the row count for on-disk entries
+                        CachedValue::ArrowMemory(array) => array.len(),
+                        CachedValue::ArrowDisk(_) => 0, // We don't know the row count for on-disk entries
                         CachedValue::Vortex(array) => array.len(),
                     };
 

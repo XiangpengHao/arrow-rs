@@ -18,7 +18,7 @@
 use std::ops::Range;
 
 use arrow_array::{Array, BooleanArray};
-use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, MutableBuffer};
 use arrow_data::bit_iterator::BitIndexIterator;
 
 use super::{RowSelection, RowSelector};
@@ -152,8 +152,9 @@ impl BooleanSelection {
             return self.intersection(other);
         }
 
-        let mut_buffer = self.selectors.copy_to_mutable();
-        let mut builder = BooleanBufferBuilder::new_from_buffer(mut_buffer, self.len());
+        let mut buffer = MutableBuffer::from_len_zeroed(self.selectors.len());
+        buffer.copy_from_slice(self.selectors.values());
+        let mut builder = BooleanBufferBuilder::new_from_buffer(buffer, self.len());
 
         // Create iterators for 'self' and 'other' bits
         let mut other_bits = other.selectors.iter();
