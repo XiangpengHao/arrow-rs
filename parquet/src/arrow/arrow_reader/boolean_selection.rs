@@ -152,7 +152,7 @@ impl BooleanSelection {
             return self.intersection(other);
         }
 
-        let mut buffer = MutableBuffer::from_len_zeroed(self.selectors.len());
+        let mut buffer = MutableBuffer::from_len_zeroed(self.selectors.inner().len());
         buffer.copy_from_slice(self.selectors.values());
         let mut builder = BooleanBufferBuilder::new_from_buffer(buffer, self.len());
 

@@ -29,6 +29,7 @@ use crate::column::page::PageIterator;
 use crate::column::reader::decoder::ColumnValueDecoder;
 use crate::file::reader::{FilePageIterator, FileReader};
 
+/// Arrow cache
 pub mod arrow_cache;
 mod builder;
 mod byte_array;

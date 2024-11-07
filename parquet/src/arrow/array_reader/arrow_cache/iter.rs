@@ -440,7 +440,7 @@ impl<'a, 'b> Iterator for BooleanSelectionPredicateIter<'a, 'b> {
 
 #[cfg(test)]
 mod tests {
-    use crate::arrow::arrow_cache::ArrowCacheMode;
+    use crate::arrow::arrow_cache::CacheMode;
     use crate::arrow::arrow_reader::{BooleanSelection, RowSelection};
 
     use super::*;
@@ -457,7 +457,7 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(array) as ArrayRef]).unwrap()
         }
 
-        let cache = ArrowArrayCache::new(ArrowCacheMode::InMemory, 32);
+        let cache = ArrowArrayCache::new(CacheMode::InMemory, 32);
 
         let row_group_id = 0;
         let column_id = 0;
