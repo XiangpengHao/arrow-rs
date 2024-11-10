@@ -3,6 +3,7 @@ use arrow_array::{Array, BinaryArray, GenericByteArray, StringArray};
 use fsst::Compressor;
 use std::sync::Arc;
 
+#[derive(Clone, Debug)]
 pub(crate) struct FsstArray {
     pub(crate) compressor: Arc<Compressor>,
     pub(crate) compressed: BinaryArray,
@@ -86,11 +87,12 @@ impl From<&FsstArray> for StringArray {
         let mut builder = StringBuilder::with_capacity(value.compressed.len(), total_size as usize);
 
         let decompressor = value.compressor.decompressor();
+        let mut decompress_buffer = Vec::with_capacity(1024);
         for v in value.compressed.iter() {
             match v {
                 Some(v) => {
-                    let decompressed = decompressor.decompress(v);
-                    let s = unsafe { std::str::from_utf8_unchecked(&decompressed) };
+                    decompressor.decompress_into(v, &mut decompress_buffer);
+                    let s = unsafe { std::str::from_utf8_unchecked(&decompress_buffer) };
                     builder.append_value(s);
                 }
                 None => {

@@ -3,6 +3,7 @@ use arrow_buffer::{Buffer, ScalarBuffer};
 use arrow_data::ArrayDataBuilder;
 use fastlanes::BitPacking;
 
+#[derive(Debug)]
 pub(crate) struct BitPackedArray<T: ArrowPrimitiveType>
 where
     T::Native: BitPacking,
@@ -10,6 +11,19 @@ where
     pub(crate) values: PrimitiveArray<T>,
     pub(crate) bit_width: u8,
     pub(crate) original_len: usize,
+}
+
+impl<T: ArrowPrimitiveType> Clone for BitPackedArray<T>
+where
+    T::Native: BitPacking,
+{
+    fn clone(&self) -> Self {
+        Self {
+            values: self.values.clone(),
+            bit_width: self.bit_width,
+            original_len: self.original_len,
+        }
+    }
 }
 
 impl<T: ArrowPrimitiveType> BitPackedArray<T>

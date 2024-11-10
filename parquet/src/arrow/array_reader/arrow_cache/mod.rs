@@ -14,6 +14,7 @@ use vortex_sampling_compressor::compressors::r#for::FoRCompressor;
 use vortex_sampling_compressor::compressors::{CompressionTree, CompressorRef};
 use vortex_sampling_compressor::SamplingCompressor;
 
+/// An array that stores strings in a dictionary format, with a bit-packed array for the keys and a FSST array for the values.
 pub mod etc_array;
 mod iter;
 mod stats;
@@ -546,16 +547,9 @@ impl ArrowArrayCache {
             },
             CachedValue::Etc(array) => match selection {
                 Some(selection) => {
-                    let dict = array.to_dict_string();
-                    let filtered = arrow_select::filter::filter(&dict, selection).unwrap();
-
-                    let new_schema = Schema::new(vec![Field::new(
-                        "_",
-                        DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
-                        schema.field(0).is_nullable(),
-                    )]);
-                    let batch = RecordBatch::try_new(Arc::new(new_schema), vec![filtered]).unwrap();
-                    Some(predicate.evaluate(batch).unwrap())
+                    let filtered = array.filter(selection);
+                    let result = predicate.evaluate_any(&filtered).unwrap();
+                    Some(result)
                 }
                 None => Some(predicate.evaluate_any(array).unwrap()),
             },

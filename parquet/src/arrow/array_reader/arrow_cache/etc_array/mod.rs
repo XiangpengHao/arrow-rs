@@ -4,19 +4,16 @@ mod fsst_array;
 use std::sync::Arc;
 
 use arrow_array::builder::StringDictionaryBuilder;
-use arrow_array::{
-    cast::AsArray,
-    types::{Int32Type, UInt32Type},
-    DictionaryArray, StringArray,
-};
-use arrow_array::{PrimitiveArray, RecordBatch};
+use arrow_array::{cast::AsArray, types::UInt32Type, DictionaryArray, StringArray};
+use arrow_array::{Array, BinaryArray, BooleanArray, PrimitiveArray, RecordBatch};
 
-use arrow_buffer::ScalarBuffer;
+use arrow_buffer::BooleanBuffer;
 use arrow_schema::{DataType, Field, Schema};
 use bit_pack_array::BitPackedArray;
 use fsst::Compressor;
 use fsst_array::FsstArray;
 
+/// Metadata for the EtcStringArray.
 #[derive(Debug)]
 pub struct EtcStringMetadata {
     compressor: Arc<Compressor>,
@@ -25,18 +22,19 @@ pub struct EtcStringMetadata {
     keys_bit_width: u8,
 }
 
+/// An array that stores strings in a dictionary format, with a bit-packed array for the keys and a FSST array for the values.
 pub struct EtcStringArray {
     keys: BitPackedArray<UInt32Type>,
     values: FsstArray,
 }
 
 impl EtcStringArray {
+    /// Create an EtcStringArray from a StringArray.
     pub fn from_string_array(array: &StringArray, compressor: Option<Arc<Compressor>>) -> Self {
         let dict = string_to_dict_string(array);
         let (keys, values) = dict.into_parts();
 
         let (_, keys, nulls) = keys.into_parts();
-        let keys: ScalarBuffer<u32> = unsafe { std::mem::transmute(keys) };
         let keys = PrimitiveArray::<UInt32Type>::try_new(keys, nulls).unwrap();
 
         let distinct_count = values.len();
@@ -59,14 +57,17 @@ impl EtcStringArray {
         }
     }
 
+    /// Get the compressor of the EtcStringArray.
     pub fn compressor(&self) -> Arc<Compressor> {
         self.values.compressor.clone()
     }
 
+    /// Get the length of the EtcStringArray.
     pub fn len(&self) -> usize {
         self.keys.len()
     }
 
+    /// Convert the EtcStringArray to a DictionaryArray.
     pub fn to_dict_string(&self) -> DictionaryArray<UInt32Type> {
         let primitive_key = self.keys.to_primitive().clone();
         let values: StringArray = StringArray::from(&self.values);
@@ -76,6 +77,7 @@ impl EtcStringArray {
         dict
     }
 
+    /// Convert the EtcStringArray to a StringArray.
     pub fn to_string_array(&self) -> StringArray {
         let dict = self.to_dict_string();
         let value = arrow_cast::cast(&dict, &DataType::Utf8).unwrap();
@@ -99,6 +101,7 @@ impl EtcStringArray {
         (batch, self.metadata())
     }
 
+    /// Reconstruct the EtcStringArray from a RecordBatch.
     pub fn from_record_batch(batch: RecordBatch, metadata: &EtcStringMetadata) -> Self {
         let key_column = batch.column(0).as_primitive::<UInt32Type>();
         let values_column = batch.column(1).as_binary();
@@ -116,6 +119,7 @@ impl EtcStringArray {
         EtcStringArray { keys, values }
     }
 
+    /// Get the metadata of the EtcStringArray.
     pub fn metadata(&self) -> EtcStringMetadata {
         EtcStringMetadata {
             compressor: self.values.compressor.clone(),
@@ -125,13 +129,65 @@ impl EtcStringArray {
         }
     }
 
+    /// Get the memory size of the EtcStringArray.
     pub fn get_array_memory_size(&self) -> usize {
         self.keys.get_array_memory_size() + self.values.get_array_memory_size()
     }
+
+    /// Filter the EtcStringArray with a BooleanArray.
+    pub fn filter(&self, selection: &BooleanArray) -> Self {
+        let values = self.values.clone();
+        let keys = self.keys.clone();
+        let primitive_keys = keys.to_primitive();
+        let filtered_keys = arrow_select::filter::filter(&primitive_keys, selection)
+            .unwrap()
+            .as_primitive::<UInt32Type>()
+            .clone();
+        let bit_packed_array = BitPackedArray::from_primitive(filtered_keys, keys.bit_width);
+        EtcStringArray {
+            keys: bit_packed_array,
+            values,
+        }
+    }
+
+    /// Compare the values of the EtcStringArray with a given string and return a BooleanArray of the result.
+    pub fn compare_not_equals(&self, needle: &str) -> BooleanArray {
+        let result = self.compare_equals(needle);
+        let (values, nulls) = result.into_parts();
+        let values = !&values;
+        BooleanArray::new(values, nulls)
+    }
+
+    /// Compare the values of the EtcStringArray with a given string.
+    pub fn compare_equals(&self, needle: &str) -> BooleanArray {
+        let compressor = &self.values.compressor;
+        let compressed = compressor.compress(needle.as_bytes());
+        let compressed = BinaryArray::new_scalar(compressed);
+
+        let values = &self.values.compressed;
+
+        let result = arrow_ord::cmp::eq(values, &compressed).unwrap();
+        let (values, nulls) = result.into_parts();
+        assert!(
+            nulls.is_none(),
+            "The dictionary values should not have nulls"
+        );
+
+        let keys = self.keys.to_primitive();
+        let mut return_mask = BooleanBuffer::new_unset(keys.len());
+        for idx in values.set_indices() {
+            let result =
+                arrow_ord::cmp::eq(&keys, &PrimitiveArray::<UInt32Type>::new_scalar(idx as u32))
+                    .unwrap();
+            let (values, _nulls) = result.into_parts();
+            return_mask = &return_mask | &values;
+        }
+        BooleanArray::new(return_mask, keys.nulls().cloned())
+    }
 }
 
-fn string_to_dict_string(input: &StringArray) -> DictionaryArray<Int32Type> {
-    let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+fn string_to_dict_string(input: &StringArray) -> DictionaryArray<UInt32Type> {
+    let mut builder = StringDictionaryBuilder::<UInt32Type>::new();
     for s in input.iter() {
         builder.append_option(s);
     }
@@ -257,6 +313,92 @@ mod tests {
         assert_eq!(input.len(), output.len());
         for i in 0..input.len() {
             assert_eq!(input.value(i), output.value(i));
+        }
+    }
+
+    #[test]
+    fn test_compare_equals_comprehensive() {
+        struct TestCase<'a> {
+            input: Vec<Option<&'a str>>,
+            needle: &'a str,
+            expected: Vec<Option<bool>>,
+        }
+
+        let test_cases = vec![
+            TestCase {
+                input: vec![Some("hello"), Some("world"), Some("hello"), Some("rust")],
+                needle: "hello",
+                expected: vec![Some(true), Some(false), Some(true), Some(false)],
+            },
+            TestCase {
+                input: vec![Some("hello"), Some("world"), Some("hello"), Some("rust")],
+                needle: "nonexistent",
+                expected: vec![Some(false), Some(false), Some(false), Some(false)],
+            },
+            TestCase {
+                input: vec![Some("hello"), None, Some("hello"), None, Some("world")],
+                needle: "hello",
+                expected: vec![Some(true), None, Some(true), None, Some(false)],
+            },
+            TestCase {
+                input: vec![Some(""), Some("hello"), Some(""), Some("world")],
+                needle: "",
+                expected: vec![Some(true), Some(false), Some(true), Some(false)],
+            },
+            TestCase {
+                input: vec![Some("same"), Some("same"), Some("same"), Some("same")],
+                needle: "same",
+                expected: vec![Some(true), Some(true), Some(true), Some(true)],
+            },
+            TestCase {
+                input: vec![
+                    Some("apple"),
+                    None,
+                    Some("banana"),
+                    Some("apple"),
+                    None,
+                    Some("cherry"),
+                ],
+                needle: "apple",
+                expected: vec![Some(true), None, Some(false), Some(true), None, Some(false)],
+            },
+            TestCase {
+                input: vec![Some("Hello"), Some("hello"), Some("HELLO"), Some("HeLLo")],
+                needle: "hello",
+                expected: vec![Some(false), Some(true), Some(false), Some(false)],
+            },
+            TestCase {
+                input: vec![
+                    Some("こんにちは"), // "Hello" in Japanese
+                    Some("世界"),       // "World" in Japanese
+                    Some("こんにちは"),
+                    Some("rust"),
+                ],
+                needle: "こんにちは",
+                expected: vec![Some(true), Some(false), Some(true), Some(false)],
+            },
+            TestCase {
+                input: vec![Some("123"), Some("456"), Some("123"), Some("789")],
+                needle: "123",
+                expected: vec![Some(true), Some(false), Some(true), Some(false)],
+            },
+            TestCase {
+                input: vec![Some("@home"), Some("#rust"), Some("@home"), Some("$money")],
+                needle: "@home",
+                expected: vec![Some(true), Some(false), Some(true), Some(false)],
+            },
+        ];
+
+        for case in test_cases {
+            let input_array: StringArray = StringArray::from(case.input.clone());
+
+            let etc = EtcStringArray::from_string_array(&input_array, None);
+
+            let result: BooleanArray = etc.compare_equals(case.needle);
+
+            let expected_array: BooleanArray = BooleanArray::from(case.expected.clone());
+
+            assert_eq!(result, expected_array,);
         }
     }
 }
