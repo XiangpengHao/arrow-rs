@@ -78,6 +78,7 @@ impl ArrowCacheStatistics {
                 CacheType::InMemory => "InMemory",
                 CacheType::OnDisk => "OnDisk",
                 CacheType::Vortex => "Vortex",
+                CacheType::Etc => "Etc",
             })
             .collect();
         let cache_types = Arc::new(DictionaryArray::new(

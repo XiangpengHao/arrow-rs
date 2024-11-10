@@ -1,6 +1,7 @@
 use crate::arrow::arrow_reader::{ArrowPredicate, BooleanSelection, RowSelection};
 use ahash::AHashMap;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use etc_array::{EtcStringArray, EtcStringMetadata};
 use utils::RangedFile;
 use vortex::arrow::FromArrowArray;
 use vortex::IntoCanonical;
@@ -13,6 +14,7 @@ use vortex_sampling_compressor::compressors::r#for::FoRCompressor;
 use vortex_sampling_compressor::compressors::{CompressionTree, CompressorRef};
 use vortex_sampling_compressor::SamplingCompressor;
 
+pub mod etc_array;
 mod iter;
 mod stats;
 mod utils;
@@ -53,6 +55,23 @@ enum CacheMode {
     OnDisk(Mutex<std::fs::File>),
     NoCache,
     Vortex(CompressorStates),
+    Etc(EtcCompressorStates),
+}
+
+#[derive(Debug)]
+struct EtcCompressorStates {
+    #[allow(dead_code)]
+    metadata: RwLock<AHashMap<ArrayIdentifier, EtcStringMetadata>>,
+    fsst_compressor: RwLock<AHashMap<(usize, usize), Arc<fsst::Compressor>>>, // (row_group_id, column_id) -> compressor
+}
+
+impl EtcCompressorStates {
+    fn new() -> Self {
+        Self {
+            metadata: RwLock::new(AHashMap::new()),
+            fsst_compressor: RwLock::new(AHashMap::new()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -174,6 +193,7 @@ enum CachedValue {
     ArrowMemory(ArrayRef),
     Vortex(Arc<vortex::Array>),
     ArrowDisk(Range<u64>),
+    Etc(EtcStringArray),
 }
 
 impl CachedValue {
@@ -182,6 +202,7 @@ impl CachedValue {
             Self::ArrowMemory(array) => array.get_array_memory_size(),
             Self::ArrowDisk(_) => 0,
             Self::Vortex(array) => array.nbytes(),
+            Self::Etc(array) => array.get_array_memory_size(),
         }
     }
 
@@ -221,11 +242,13 @@ impl Display for CachedValue {
             Self::ArrowMemory(_) => write!(f, "ArrowMemory"),
             Self::Vortex(_) => write!(f, "Vortex"),
             Self::ArrowDisk(_) => write!(f, "ArrowDisk"),
+            Self::Etc(_) => write!(f, "Etc"),
         }
     }
 }
 
 /// ArrayIdentifier is used to identify an array in the cache.
+#[derive(Debug)]
 pub struct ArrayIdentifier {
     row_group_id: usize,
     column_id: usize,
@@ -252,6 +275,8 @@ pub enum CacheType {
     OnDisk,
     /// Vortex cache
     Vortex,
+    /// Etc cache
+    Etc,
 }
 
 /// ArrowArrayCache is used to cache arrow arrays in memory, on disk, or in a vortex.
@@ -274,8 +299,9 @@ impl ArrowArrayCache {
             "inmemory" => CacheMode::InMemory,
             "nocache" => CacheMode::NoCache,
             "vortex" => CacheMode::Vortex(CompressorStates::new()),
+            "etc" => CacheMode::Etc(EtcCompressorStates::new()),
             _ => panic!(
-                "Invalid cache mode: {}, must be one of [disk, inmemory, nocache, vortex]",
+                "Invalid cache mode: {}, must be one of [disk, inmemory, nocache, vortex, etc]",
                 v
             ),
         });
@@ -518,6 +544,21 @@ impl ArrowArrayCache {
                 }
                 None => Some(predicate.evaluate_any(array).unwrap()),
             },
+            CachedValue::Etc(array) => match selection {
+                Some(selection) => {
+                    let dict = array.to_dict_string();
+                    let filtered = arrow_select::filter::filter(&dict, selection).unwrap();
+
+                    let new_schema = Schema::new(vec![Field::new(
+                        "_",
+                        DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                        schema.field(0).is_nullable(),
+                    )]);
+                    let batch = RecordBatch::try_new(Arc::new(new_schema), vec![filtered]).unwrap();
+                    Some(predicate.evaluate(batch).unwrap())
+                }
+                None => Some(predicate.evaluate_any(array).unwrap()),
+            },
         }
     }
 
@@ -582,6 +623,18 @@ impl ArrowArrayCache {
                         .into_arrow()
                         .unwrap(),
                 ),
+            },
+            CachedValue::Etc(array) => match selection {
+                Some(selection) => {
+                    let array = array.to_dict_string();
+                    let filtered = arrow_select::filter::filter(&array, selection).unwrap();
+                    let casted = arrow_cast::cast(&filtered, &DataType::Utf8).unwrap();
+                    Some(casted)
+                }
+                None => {
+                    let array = array.to_string_array();
+                    Some(Arc::new(array))
+                }
             },
         }
     }
@@ -705,6 +758,31 @@ impl ArrowArrayCache {
             CacheMode::NoCache => {
                 unreachable!()
             }
+
+            CacheMode::Etc(ref states) => {
+                let compressor = states.fsst_compressor.read().unwrap();
+                if let Some(compressor) = compressor.get(&(id.row_group_id, id.column_id)) {
+                    let compressed = EtcStringArray::from_string_array(
+                        array.as_string::<i32>(),
+                        Some(compressor.clone()),
+                    );
+                    column_cache.insert(
+                        id.row_id,
+                        CachedEntry::new(CachedValue::Etc(compressed), array.len()),
+                    );
+                    return;
+                }
+
+                drop(compressor);
+                let mut compressors = states.fsst_compressor.write().unwrap();
+                let compressed = EtcStringArray::from_string_array(&array.as_string::<i32>(), None);
+                let compressor = compressed.compressor();
+                compressors.insert((id.row_group_id, id.column_id), compressor);
+                column_cache.insert(
+                    id.row_id,
+                    CachedEntry::new(CachedValue::Etc(compressed), array.len()),
+                );
+            }
         }
     }
 
@@ -722,6 +800,7 @@ impl ArrowArrayCache {
                         CachedValue::ArrowMemory(_) => CacheType::InMemory,
                         CachedValue::ArrowDisk(_) => CacheType::OnDisk,
                         CachedValue::Vortex(_) => CacheType::Vortex,
+                        CachedValue::Etc(_) => CacheType::Etc,
                     };
 
                     let memory_size = cached_entry.value.memory_usage();
@@ -729,6 +808,7 @@ impl ArrowArrayCache {
                         CachedValue::ArrowMemory(array) => array.len(),
                         CachedValue::ArrowDisk(_) => 0, // We don't know the row count for on-disk entries
                         CachedValue::Vortex(array) => array.len(),
+                        CachedValue::Etc(array) => array.len(),
                     };
 
                     stats.add_entry(

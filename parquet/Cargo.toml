@@ -75,6 +75,8 @@ vortex-fastlanes = { path = "../../vortex/encodings/fastlanes" }
 vortex-sampling-compressor = { path = "../../vortex/vortex-sampling-compressor"}
 itertools = "0.13.0"
 ahash = "0.8"
+fsst-rs = { path = "../../fsst" } 
+fastlanes = "0.1.8"
 
 [dev-dependencies]
 base64 = { version = "0.22", default-features = false, features = ["std"] }
