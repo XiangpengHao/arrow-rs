@@ -1,5 +1,6 @@
 mod bit_pack_array;
 mod fsst_array;
+mod primitive_array;
 
 use std::sync::Arc;
 
