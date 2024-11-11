@@ -1,7 +1,7 @@
 use crate::arrow::arrow_reader::{ArrowPredicate, BooleanSelection, RowSelection};
 use ahash::AHashMap;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use etc_array::{EtcStringArray, EtcStringMetadata};
+use etc_array::{EtcArrayRef, EtcStringArray, EtcStringMetadata};
 use utils::RangedFile;
 use vortex::arrow::FromArrowArray;
 use vortex::IntoCanonical;
@@ -194,7 +194,7 @@ enum CachedValue {
     ArrowMemory(ArrayRef),
     Vortex(Arc<vortex::Array>),
     ArrowDisk(Range<u64>),
-    Etc(EtcStringArray),
+    Etc(EtcArrayRef),
 }
 
 impl CachedValue {
@@ -620,13 +620,12 @@ impl ArrowArrayCache {
             },
             CachedValue::Etc(array) => match selection {
                 Some(selection) => {
-                    let array = array.to_dict_string();
-                    let filtered = arrow_select::filter::filter(&array, selection).unwrap();
-                    let casted = arrow_cast::cast(&filtered, &DataType::Utf8).unwrap();
-                    Some(casted)
+                    let array = array.filter(selection);
+                    let arrow_array = array.to_arrow_array();
+                    Some(arrow_array)
                 }
                 None => {
-                    let array = array.to_string_array();
+                    let array = array.to_arrow_array();
                     Some(Arc::new(array))
                 }
             },
@@ -762,7 +761,7 @@ impl ArrowArrayCache {
                     );
                     column_cache.insert(
                         id.row_id,
-                        CachedEntry::new(CachedValue::Etc(compressed), array.len()),
+                        CachedEntry::new(CachedValue::Etc(Arc::new(compressed)), array.len()),
                     );
                     return;
                 }
@@ -774,7 +773,7 @@ impl ArrowArrayCache {
                 compressors.insert((id.row_group_id, id.column_id), compressor);
                 column_cache.insert(
                     id.row_id,
-                    CachedEntry::new(CachedValue::Etc(compressed), array.len()),
+                    CachedEntry::new(CachedValue::Etc(Arc::new(compressed)), array.len()),
                 );
             }
         }

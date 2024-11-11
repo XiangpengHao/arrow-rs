@@ -38,6 +38,14 @@ where
         }
     }
 
+    pub fn new_null_array(len: usize) -> Self {
+        Self {
+            values: PrimitiveArray::<T>::new_null(len),
+            bit_width: 0,
+            original_len: len,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.original_len
     }
@@ -106,6 +114,12 @@ where
     }
 
     pub(crate) fn to_primitive(&self) -> PrimitiveArray<T> {
+        let nulls = self.values.nulls().cloned();
+        if let Some(nulls) = nulls {
+            if nulls.null_count() == self.original_len {
+                return self.values.clone();
+            }
+        }
         let bit_width = self.bit_width as usize;
         let packed = self.values.values().as_ref();
         let length = self.original_len;
