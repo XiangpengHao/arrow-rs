@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::sync::Arc;
 
 use arrow_array::builder::StringDictionaryBuilder;
@@ -13,6 +14,10 @@ use crate::arrow::arrow_cache::etc_array::{get_bit_width, FsstArray};
 use super::{BitPackedArray, EtcArray, EtcArrayRef};
 
 impl EtcArray for EtcStringArray {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn get_array_memory_size(&self) -> usize {
         self.keys.get_array_memory_size() + self.values.get_array_memory_size()
     }
@@ -21,9 +26,11 @@ impl EtcArray for EtcStringArray {
         self.keys.len()
     }
 
-    fn to_arrow_array(&self) -> ArrayRef {
+    #[inline]
+    fn to_arrow_array(&self) -> (ArrayRef, Schema) {
         let dict = self.to_string_array();
-        Arc::new(dict)
+        let schema = Schema::new(vec![Field::new("", DataType::Utf8, false)]);
+        (Arc::new(dict), schema)
     }
 
     fn filter(&self, selection: &BooleanArray) -> EtcArrayRef {
@@ -197,7 +204,6 @@ fn string_to_dict_string(input: &StringArray) -> DictionaryArray<UInt32Type> {
     }
     builder.finish()
 }
-
 
 #[cfg(test)]
 mod tests {

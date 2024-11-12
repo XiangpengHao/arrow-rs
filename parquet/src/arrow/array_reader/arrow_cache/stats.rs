@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use std::sync::{atomic::Ordering, Arc};
 
 use arrow_array::{DictionaryArray, RecordBatch, StringArray, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 
-use super::CacheType;
+use super::{ArrowArrayCache, CacheType, CachedValue};
 
 /// ArrowCacheStatistics is used to collect statistics about the arrow array cache.
 #[derive(Debug, serde::Serialize)]
@@ -113,5 +113,48 @@ impl ArrowCacheStatistics {
             ],
         )
         .unwrap()
+    }
+}
+
+impl ArrowArrayCache {
+    /// Collect statistics about the cache.
+    pub fn stats(&self) -> ArrowCacheStatistics {
+        let mut stats = ArrowCacheStatistics::new();
+
+        for (row_group_id, row_group_lock) in self.value.iter().enumerate() {
+            let row_group = row_group_lock.read().unwrap();
+
+            for (column_id, row_mapping) in row_group.iter() {
+                for (row_start_id, cached_entry) in row_mapping {
+                    let cached_entry = cached_entry.value();
+                    let cache_type = match &cached_entry.value {
+                        CachedValue::ArrowMemory(_) => CacheType::InMemory,
+                        CachedValue::ArrowDisk(_) => CacheType::OnDisk,
+                        CachedValue::Vortex(_) => CacheType::Vortex,
+                        CachedValue::Etc(_) => CacheType::Etc,
+                    };
+
+                    let memory_size = cached_entry.value.memory_usage();
+                    let row_count = match &cached_entry.value {
+                        CachedValue::ArrowMemory(array) => array.len(),
+                        CachedValue::ArrowDisk(_) => 0, // We don't know the row count for on-disk entries
+                        CachedValue::Vortex(array) => array.len(),
+                        CachedValue::Etc(array) => array.len(),
+                    };
+
+                    stats.add_entry(
+                        row_group_id as u64,
+                        *column_id as u64,
+                        *row_start_id as u64,
+                        row_count as u64,
+                        memory_size as u64,
+                        cache_type,
+                        cached_entry.hit_count.load(Ordering::Relaxed) as u64,
+                    );
+                }
+            }
+        }
+
+        stats
     }
 }

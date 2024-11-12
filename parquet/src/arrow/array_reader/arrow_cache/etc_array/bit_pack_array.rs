@@ -50,6 +50,10 @@ where
         self.original_len
     }
 
+    pub fn is_nullable(&self) -> bool {
+        self.values.is_nullable()
+    }
+
     pub fn from_primitive(array: PrimitiveArray<T>, bit_width: u8) -> Self {
         let original_len = array.len();
         let (_data_type, values, nulls) = array.into_parts();

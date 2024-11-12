@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -5,13 +6,13 @@ use arrow_array::{
     types::{
         Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
-    ArrowPrimitiveType, PrimitiveArray, RecordBatch,
+    ArrayRef, ArrowPrimitiveType, BooleanArray, PrimitiveArray, RecordBatch,
 };
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{Field, Schema};
 use fastlanes::BitPacking;
 
-use crate::arrow::arrow_cache::etc_array::get_bit_width;
+use crate::arrow::arrow_cache::etc_array::{get_bit_width, EtcArray, EtcArrayRef};
 
 use super::BitPackedArray;
 
@@ -40,6 +41,7 @@ impl_has_unsigned_type! {
     UInt8Type => UInt8Type
 }
 
+/// The metadata for an ETC primitive array.
 #[derive(Debug, Clone)]
 pub struct EtcPrimitiveMetadata {
     reference_value: u64,
@@ -63,14 +65,63 @@ where
     T: ArrowPrimitiveType + HasUnsignedType,
     <<T as HasUnsignedType>::UnSignedType as ArrowPrimitiveType>::Native: BitPacking,
 {
+    /// Get the memory size of the ETC primitive array.
     pub fn get_array_memory_size(&self) -> usize {
         self.values.get_array_memory_size() + std::mem::size_of::<T::Native>()
+    }
+
+    /// Get the length of the ETC primitive array.
+    pub fn len(&self) -> usize {
+        self.values.original_len
     }
 }
 
 macro_rules! impl_etc_primitive_array {
     ($ty:ty) => {
+
+        impl EtcArray for EtcPrimitiveArray<$ty> {
+            fn get_array_memory_size(&self) -> usize {
+                self.get_array_memory_size()
+            }
+
+            fn len(&self) -> usize {
+                self.len()
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            #[inline]
+            fn to_arrow_array(&self) -> (ArrayRef, Schema) {
+                let unsigned_array = self.values.to_primitive();
+				let (_data_type, values, nulls) = unsigned_array.into_parts();
+				let values =
+					if self.reference_value != 0 {
+						ScalarBuffer::from_iter(values.iter().map(|v| {
+							(*v)
+								.wrapping_add(self.reference_value as <<$ty as HasUnsignedType>::UnSignedType as ArrowPrimitiveType>::Native)
+								as <$ty as ArrowPrimitiveType>::Native
+						}))
+					} else {
+						unsafe { std::mem::transmute(values) }
+					};
+                let schema = Schema::new(vec![Field::new("", <$ty as ArrowPrimitiveType>::DATA_TYPE, self.values.is_nullable())]);
+				let array = Arc::new(PrimitiveArray::<$ty>::new(values, nulls));
+				(array, schema)
+            }
+
+            fn filter(&self, selection: &BooleanArray) -> EtcArrayRef {
+                let (values, _) = self.to_arrow_array();
+                let filtered_values = arrow_select::filter::filter(&values, selection).unwrap();
+                let primitive_values = filtered_values.as_primitive::<$ty>().clone();
+                let bit_packed = Self::from_arrow_array(primitive_values);
+                Arc::new(bit_packed)
+            }
+        }
+
         impl EtcPrimitiveArray<$ty> {
+            /// Create an ETC primitive array from an Arrow primitive array.
             pub fn from_arrow_array(arrow_array: PrimitiveArray<$ty>) -> Self {
 
                 let min = match arrow_arith::aggregate::min(&arrow_array){
@@ -115,6 +166,7 @@ macro_rules! impl_etc_primitive_array {
                 }
             }
 
+            /// Get the metadata for an ETC primitive array.
 			pub fn metadata(&self) -> EtcPrimitiveMetadata {
 				EtcPrimitiveMetadata {
 					reference_value: self.reference_value as u64,
@@ -123,23 +175,7 @@ macro_rules! impl_etc_primitive_array {
 				}
 			}
 
-			pub fn to_arrow_array(&self) -> PrimitiveArray<$ty> {
-				let unsigned_array = self.values.to_primitive();
-				let (_data_type, values, nulls) = unsigned_array.into_parts();
-				let values =
-					if self.reference_value != 0 {
-						ScalarBuffer::from_iter(values.iter().map(|v| {
-							(*v)
-								.wrapping_add(self.reference_value as <<$ty as HasUnsignedType>::UnSignedType as ArrowPrimitiveType>::Native)
-								as <$ty as ArrowPrimitiveType>::Native
-						}))
-					} else {
-						unsafe { std::mem::transmute(values) }
-					};
-				PrimitiveArray::<$ty>::new(values, nulls)
-			}
-
-
+            /// Convert an ETC primitive array to a record batch.
 			pub fn to_record_batch(&self) -> (RecordBatch, EtcPrimitiveMetadata) {
                 let schema = Schema::new(vec![Field::new("values", <$ty as ArrowPrimitiveType>::DATA_TYPE, false)]);
 
@@ -151,6 +187,7 @@ macro_rules! impl_etc_primitive_array {
 			}
 
 
+            /// Create an ETC primitive array from a record batch.
 			pub fn from_record_batch(batch: RecordBatch, metadata: &EtcPrimitiveMetadata) -> Self {
 				let values = batch.column(0).as_primitive::<<$ty as HasUnsignedType>::UnSignedType>().clone();
 				let values = BitPackedArray::from_parts(values, metadata.bit_width, metadata.original_len);
@@ -175,7 +212,6 @@ impl_etc_primitive_array!(UInt64Type);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::Array;
 
     macro_rules! test_roundtrip {
         ($test_name:ident, $type:ty, $values:expr) => {
@@ -187,9 +223,9 @@ mod tests {
 
                 // Convert to ETC array and back
                 let etc_array = EtcPrimitiveArray::<$type>::from_arrow_array(array.clone());
-                let result_array = etc_array.to_arrow_array();
+                let (result_array, _) = etc_array.to_arrow_array();
 
-                assert_eq!(result_array, array);
+                assert_eq!(result_array.as_ref(), &array);
             }
         };
     }
@@ -300,7 +336,7 @@ mod tests {
         let original: Vec<Option<i32>> = vec![None, None, None];
         let array = PrimitiveArray::<Int32Type>::from(original.clone());
         let etc_array = EtcPrimitiveArray::<Int32Type>::from_arrow_array(array);
-        let result_array = etc_array.to_arrow_array();
+        let (result_array, _) = etc_array.to_arrow_array();
 
         assert_eq!(result_array.len(), original.len());
         assert_eq!(result_array.null_count(), original.len());
@@ -311,10 +347,10 @@ mod tests {
         let original: Vec<Option<i32>> = vec![Some(0), Some(1), Some(2), None, Some(4)];
         let array = PrimitiveArray::<Int32Type>::from(original.clone());
         let etc_array = EtcPrimitiveArray::<Int32Type>::from_arrow_array(array.clone());
-        let result_array = etc_array.to_arrow_array();
+        let (result_array, _) = etc_array.to_arrow_array();
 
         assert_eq!(etc_array.reference_value, 0);
-        assert_eq!(result_array, array);
+        assert_eq!(result_array.as_ref(), &array);
     }
 
     #[test]
@@ -322,8 +358,8 @@ mod tests {
         let original: Vec<Option<i32>> = vec![Some(42)];
         let array = PrimitiveArray::<Int32Type>::from(original.clone());
         let etc_array = EtcPrimitiveArray::<Int32Type>::from_arrow_array(array.clone());
-        let result_array = etc_array.to_arrow_array();
+        let (result_array, _) = etc_array.to_arrow_array();
 
-        assert_eq!(result_array, array);
+        assert_eq!(result_array.as_ref(), &array);
     }
 }

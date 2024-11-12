@@ -1,7 +1,7 @@
 use crate::arrow::arrow_reader::{ArrowPredicate, BooleanSelection, RowSelection};
 use ahash::AHashMap;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use etc_array::{EtcArrayRef, EtcStringArray, EtcStringMetadata};
+use etc_array::{EtcArrayRef, EtcPrimitiveArray, EtcStringArray, EtcStringMetadata};
 use utils::RangedFile;
 use vortex::arrow::FromArrowArray;
 use vortex::IntoCanonical;
@@ -621,12 +621,12 @@ impl ArrowArrayCache {
             CachedValue::Etc(array) => match selection {
                 Some(selection) => {
                     let array = array.filter(selection);
-                    let arrow_array = array.to_arrow_array();
+                    let (arrow_array, _) = array.to_arrow_array();
                     Some(arrow_array)
                 }
                 None => {
-                    let array = array.to_arrow_array();
-                    Some(Arc::new(array))
+                    let (arrow_array, _) = array.to_arrow_array();
+                    Some(arrow_array)
                 }
             },
         }
@@ -753,71 +753,92 @@ impl ArrowArrayCache {
             }
 
             CacheMode::Etc(ref states) => {
-                let compressor = states.fsst_compressor.read().unwrap();
-                if let Some(compressor) = compressor.get(&(id.row_group_id, id.column_id)) {
-                    let compressed = EtcStringArray::from_string_array(
-                        array.as_string::<i32>(),
-                        Some(compressor.clone()),
-                    );
+                let data_type = array.data_type();
+                let array = array.as_ref();
+                if data_type.is_primitive() {
+                    let primitive: EtcArrayRef = match data_type {
+                        DataType::Int8 => {
+                            Arc::new(EtcPrimitiveArray::<ArrowInt8Type>::from_arrow_array(
+                                array.as_primitive::<ArrowInt8Type>().clone(),
+                            ))
+                        }
+                        DataType::Int16 => {
+                            Arc::new(EtcPrimitiveArray::<ArrowInt16Type>::from_arrow_array(
+                                array.as_primitive::<ArrowInt16Type>().clone(),
+                            ))
+                        }
+                        DataType::Int32 => {
+                            Arc::new(EtcPrimitiveArray::<ArrowInt32Type>::from_arrow_array(
+                                array.as_primitive::<ArrowInt32Type>().clone(),
+                            ))
+                        }
+                        DataType::Int64 => {
+                            Arc::new(EtcPrimitiveArray::<ArrowInt64Type>::from_arrow_array(
+                                array.as_primitive::<ArrowInt64Type>().clone(),
+                            ))
+                        }
+                        DataType::UInt8 => {
+                            Arc::new(EtcPrimitiveArray::<ArrowUInt8Type>::from_arrow_array(
+                                array.as_primitive::<ArrowUInt8Type>().clone(),
+                            ))
+                        }
+                        DataType::UInt16 => {
+                            Arc::new(EtcPrimitiveArray::<ArrowUInt16Type>::from_arrow_array(
+                                array.as_primitive::<ArrowUInt16Type>().clone(),
+                            ))
+                        }
+                        DataType::UInt32 => {
+                            Arc::new(EtcPrimitiveArray::<ArrowUInt32Type>::from_arrow_array(
+                                array.as_primitive::<ArrowUInt32Type>().clone(),
+                            ))
+                        }
+                        DataType::UInt64 => {
+                            Arc::new(EtcPrimitiveArray::<ArrowUInt64Type>::from_arrow_array(
+                                array.as_primitive::<ArrowUInt64Type>().clone(),
+                            ))
+                        }
+                        _ => panic!("unsupported data type {:?}", data_type),
+                    };
                     column_cache.insert(
                         id.row_id,
-                        CachedEntry::new(CachedValue::Etc(Arc::new(compressed)), array.len()),
+                        CachedEntry::new(CachedValue::Etc(primitive), array.len()),
                     );
                     return;
                 }
+                // other types
+                match array.data_type() {
+                    DataType::Utf8 => {
+                        let compressor = states.fsst_compressor.read().unwrap();
+                        if let Some(compressor) = compressor.get(&(id.row_group_id, id.column_id)) {
+                            let compressed = EtcStringArray::from_string_array(
+                                array.as_string::<i32>(),
+                                Some(compressor.clone()),
+                            );
+                            column_cache.insert(
+                                id.row_id,
+                                CachedEntry::new(
+                                    CachedValue::Etc(Arc::new(compressed)),
+                                    array.len(),
+                                ),
+                            );
+                            return;
+                        }
 
-                drop(compressor);
-                let mut compressors = states.fsst_compressor.write().unwrap();
-                let compressed = EtcStringArray::from_string_array(&array.as_string::<i32>(), None);
-                let compressor = compressed.compressor();
-                compressors.insert((id.row_group_id, id.column_id), compressor);
-                column_cache.insert(
-                    id.row_id,
-                    CachedEntry::new(CachedValue::Etc(Arc::new(compressed)), array.len()),
-                );
-            }
-        }
-    }
-
-    /// Collect statistics about the cache.
-    pub fn stats(&self) -> ArrowCacheStatistics {
-        let mut stats = ArrowCacheStatistics::new();
-
-        for (row_group_id, row_group_lock) in self.value.iter().enumerate() {
-            let row_group = row_group_lock.read().unwrap();
-
-            for (column_id, row_mapping) in row_group.iter() {
-                for (row_start_id, cached_entry) in row_mapping {
-                    let cached_entry = cached_entry.value();
-                    let cache_type = match &cached_entry.value {
-                        CachedValue::ArrowMemory(_) => CacheType::InMemory,
-                        CachedValue::ArrowDisk(_) => CacheType::OnDisk,
-                        CachedValue::Vortex(_) => CacheType::Vortex,
-                        CachedValue::Etc(_) => CacheType::Etc,
-                    };
-
-                    let memory_size = cached_entry.value.memory_usage();
-                    let row_count = match &cached_entry.value {
-                        CachedValue::ArrowMemory(array) => array.len(),
-                        CachedValue::ArrowDisk(_) => 0, // We don't know the row count for on-disk entries
-                        CachedValue::Vortex(array) => array.len(),
-                        CachedValue::Etc(array) => array.len(),
-                    };
-
-                    stats.add_entry(
-                        row_group_id as u64,
-                        *column_id as u64,
-                        *row_start_id as u64,
-                        row_count as u64,
-                        memory_size as u64,
-                        cache_type,
-                        cached_entry.hit_count.load(Ordering::Relaxed) as u64,
-                    );
+                        drop(compressor);
+                        let mut compressors = states.fsst_compressor.write().unwrap();
+                        let compressed =
+                            EtcStringArray::from_string_array(&array.as_string::<i32>(), None);
+                        let compressor = compressed.compressor();
+                        compressors.insert((id.row_group_id, id.column_id), compressor);
+                        column_cache.insert(
+                            id.row_id,
+                            CachedEntry::new(CachedValue::Etc(Arc::new(compressed)), array.len()),
+                        );
+                    }
+                    _ => panic!("unsupported data type {:?}", array.data_type()),
                 }
             }
         }
-
-        stats
     }
 }
 
