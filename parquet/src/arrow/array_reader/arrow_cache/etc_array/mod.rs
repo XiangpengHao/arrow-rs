@@ -68,6 +68,11 @@ pub trait EtcArray: std::fmt::Debug + Send + Sync {
     /// Get the length of the ETC array.
     fn len(&self) -> usize;
 
+    /// Check if the ETC array is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Convert the ETC array to an Arrow array.
     fn to_arrow_array(&self) -> (ArrayRef, Schema);
 

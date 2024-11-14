@@ -670,7 +670,7 @@ where
                 let predicate_projection = predicate.projection();
                 let predicate_schema = Arc::new(schema_from_projection(
                     self.fields.as_deref().unwrap(),
-                    &predicate_projection,
+                    predicate_projection,
                 ));
 
                 let predicate_column_idx = predicate_projection
@@ -688,7 +688,7 @@ where
                             .sorted_by_key(|range| range.start)
                             .collect_vec();
                         let cached_ranges = BooleanSelection::from_consecutive_ranges(
-                            sorted_ranges.iter().map(|r| r.clone()),
+                            sorted_ranges.iter().cloned(),
                             row_group.row_count,
                         );
 
@@ -793,7 +793,7 @@ where
                         .sorted_by_key(|range| range.start)
                         .collect_vec();
                     let cached_ranges = BooleanSelection::from_consecutive_ranges(
-                        sorted_ranges.iter().map(|r| r.clone()),
+                        sorted_ranges.iter().cloned(),
                         row_group.row_count,
                     );
                     let selection_from_cache = selection.intersection(&cached_ranges);
@@ -881,7 +881,7 @@ where
             let parquet_column_id = parquet_column_ids[0];
             let iter = ArrowArrayCache::get().get_record_batches_by_selection_with_predicate(
                 row_group_id,
-                &selection,
+                selection,
                 schema,
                 parquet_column_id,
                 predicate,
@@ -934,10 +934,10 @@ where
         // warm up cache if there's a cache reader
         let aligned_selection = align_selection_to_batch_boundary(selection, 8192);
         row_group
-            .fetch(input, &projection, Some(&aligned_selection))
+            .fetch(input, projection, Some(&aligned_selection))
             .await?;
         let array_reader =
-            build_cached_array_reader(fields, &projection, row_group, row_group_idx).unwrap();
+            build_cached_array_reader(fields, projection, row_group, row_group_idx).unwrap();
 
         let reader = ParquetRecordBatchReader::new(8192, array_reader, Some(aligned_selection));
 
@@ -1004,7 +1004,7 @@ impl Iterator for CacheRecordBatchReader {
     type Item = Result<RecordBatch, arrow_schema::ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(|b| Ok(b))
+        self.iter.next().map(Ok)
     }
 }
 

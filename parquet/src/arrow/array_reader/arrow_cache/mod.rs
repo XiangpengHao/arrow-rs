@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, RwLockReadGuard};
 
 static ARROW_ARRAY_CACHE: LazyLock<ArrowArrayCache> =
-    LazyLock::new(|| ArrowArrayCache::initialize_from_env());
+    LazyLock::new(ArrowArrayCache::initialize_from_env);
 
 static ARROW_DISK_CACHE_PATH: &str = "target/arrow_disk_cache.etc";
 
@@ -422,8 +422,8 @@ impl ArrowArrayCache {
     }
 
     /// Get a record batch from a row selection.
-    pub fn get_record_batches<'a>(
-        &'a self,
+    pub fn get_record_batches(
+        &self,
         row_group_id: usize,
         selection: BooleanSelection,
         schema: &SchemaRef,
@@ -435,17 +435,16 @@ impl ArrowArrayCache {
         let iter = ArrowArrayCache::get().get_record_batches_by_filter(
             row_group_id,
             selection,
-            &schema,
-            &parquet_column_ids,
+            schema,
+            parquet_column_ids,
         );
-        let iter = if !is_selective {
+        if !is_selective {
             // means we have many small selections, we should coalesce them
             let coalesced = iter::CoalescedIter::new(iter, self.batch_size);
             Box::new(coalesced) as Box<dyn Iterator<Item = RecordBatch> + Send>
         } else {
             Box::new(iter)
-        };
-        iter
+        }
     }
 
     /// Get a record batch iterator from a row selection.
@@ -560,7 +559,7 @@ impl ArrowArrayCache {
             CachedValue::Vortex(array) => match selection {
                 Some(selection) => {
                     let selection = vortex::Array::from_arrow(selection, false);
-                    let filtered = vortex::compute::filter(&array, &selection).unwrap();
+                    let filtered = vortex::compute::filter(array, &selection).unwrap();
                     let array = predicate.evaluate_any(&filtered).unwrap();
                     Some(array)
                 }
@@ -618,7 +617,7 @@ impl ArrowArrayCache {
             CachedValue::Vortex(array) => match selection {
                 Some(selection) => {
                     let predicate = vortex::Array::from_arrow(selection, false);
-                    let filtered = vortex::compute::filter(&array, &predicate).unwrap();
+                    let filtered = vortex::compute::filter(array, &predicate).unwrap();
                     let array = filtered.into_canonical().unwrap();
                     let canonical_array = array.into_arrow().unwrap();
 
@@ -860,7 +859,7 @@ impl ArrowArrayCache {
                         drop(compressor);
                         let (mut compressors, _) = states.fsst_compressor.write(&mut column_ctx);
                         let compressed =
-                            EtcStringArray::from_string_array(&array.as_string::<i32>(), None);
+                            EtcStringArray::from_string_array(array.as_string::<i32>(), None);
                         let compressor = compressed.compressor();
                         compressors.insert((id.row_group_id, id.column_id), compressor);
                         column_cache.insert(

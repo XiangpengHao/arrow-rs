@@ -78,7 +78,7 @@ impl EtcStringArray {
         let max_bit_width = get_bit_width(distinct_count as u64);
         debug_assert!(2u64.pow(max_bit_width as u32) >= distinct_count as u64);
 
-        let bit_packed_array = BitPackedArray::from_primitive(keys, max_bit_width as u8);
+        let bit_packed_array = BitPackedArray::from_primitive(keys, max_bit_width);
 
         let dict_values = values.as_string::<i32>();
 
@@ -103,10 +103,7 @@ impl EtcStringArray {
     pub fn to_dict_string(&self) -> DictionaryArray<UInt32Type> {
         let primitive_key = self.keys.to_primitive().clone();
         let values: StringArray = StringArray::from(&self.values);
-        let dict = unsafe {
-            DictionaryArray::<UInt32Type>::new_unchecked(primitive_key, Arc::new(values))
-        };
-        dict
+        unsafe { DictionaryArray::<UInt32Type>::new_unchecked(primitive_key, Arc::new(values)) }
     }
 
     /// Convert the EtcStringArray to a StringArray.

@@ -74,6 +74,11 @@ where
     pub fn len(&self) -> usize {
         self.values.original_len
     }
+
+    /// Check if the ETC primitive array is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 macro_rules! impl_etc_primitive_array {
@@ -93,6 +98,7 @@ macro_rules! impl_etc_primitive_array {
             }
 
             #[inline]
+            #[allow(clippy::useless_transmute, clippy::missing_transmute_annotations)]
             fn to_arrow_array(&self) -> (ArrayRef, Schema) {
                 let unsigned_array = self.values.to_primitive();
 				let (_data_type, values, nulls) = unsigned_array.into_parts();
@@ -122,6 +128,7 @@ macro_rules! impl_etc_primitive_array {
 
         impl EtcPrimitiveArray<$ty> {
             /// Create an ETC primitive array from an Arrow primitive array.
+            #[allow(clippy::useless_transmute, clippy::missing_transmute_annotations)]
             pub fn from_arrow_array(arrow_array: PrimitiveArray<$ty>) -> Self {
 
                 let min = match arrow_arith::aggregate::min(&arrow_array){

@@ -211,7 +211,7 @@ impl BooleanBuffer {
         debug_assert_eq!(self.offset, 0);
         let mut buffer = MutableBuffer::from_len_zeroed(self.buffer.len());
         buffer.copy_from_slice(self.values());
-        buffer.into()
+        buffer
     }
 }
 

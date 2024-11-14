@@ -84,7 +84,7 @@ impl FsstArray {
 impl From<&FsstArray> for StringArray {
     fn from(value: &FsstArray) -> Self {
         let total_size = value.uncompressed_len;
-        let mut builder = StringBuilder::with_capacity(value.compressed.len(), total_size as usize);
+        let mut builder = StringBuilder::with_capacity(value.compressed.len(), total_size);
 
         let decompressor = value.compressor.decompressor();
         let mut decompress_buffer = Vec::with_capacity(1024);

@@ -265,7 +265,7 @@ impl<T: Iterator<Item = RecordBatch> + Send> CoalescedIter<T> {
         } else {
             let schema = record_batch.schema();
             self.buffer.push(record_batch);
-            let buffer = std::mem::replace(&mut self.buffer, vec![]);
+            let buffer = std::mem::take(&mut self.buffer);
             let coalesced = concat_batches(&schema, &buffer).unwrap();
             Some(coalesced)
         }

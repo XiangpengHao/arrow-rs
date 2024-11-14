@@ -65,6 +65,11 @@ impl BooleanSelection {
         self.selectors.len()
     }
 
+    /// Check if the BooleanSelection is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Returns the number of rows selected by this BooleanSelection.
     pub fn row_count(&self) -> usize {
         self.selectors.count_set_bits()

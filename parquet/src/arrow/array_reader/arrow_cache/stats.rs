@@ -6,7 +6,7 @@ use arrow_schema::{DataType, Field, Schema};
 use super::{ArrowArrayCache, CacheType, CachedValue, LockCtx};
 
 /// ArrowCacheStatistics is used to collect statistics about the arrow array cache.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, Default)]
 pub struct ArrowCacheStatistics {
     /// Row group ids
     pub row_group_ids: Vec<u64>,
@@ -39,6 +39,7 @@ impl ArrowCacheStatistics {
     }
 
     /// Add an entry to the statistics.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_entry(
         &mut self,
         row_group_id: u64,

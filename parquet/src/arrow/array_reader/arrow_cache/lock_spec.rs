@@ -9,7 +9,9 @@
 ///
 /// Also read: https://lwn.net/Articles/995814/
 
-pub unsafe trait LockBefore<Other> {}
+/// # Safety
+/// Not safe.
+pub(crate) unsafe trait LockBefore<Other> {}
 
 /// Specify that `A` happens before `B`, and any `X` that happens before `A` must also happens before `B`.
 macro_rules! impl_lock_before_all {
