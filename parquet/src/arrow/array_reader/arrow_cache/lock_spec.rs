@@ -5,7 +5,7 @@
 /// I.e., if users does not follow the lock ordering, the code will not compile.
 ///
 /// Note: this is a rather experimental thing that I'm quite excited about.
-/// Think of the lock ordering as lock spec in verification.
+/// Think of this as specification in verification context.
 ///
 /// Also read: https://lwn.net/Articles/995814/
 

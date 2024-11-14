@@ -2,7 +2,7 @@ use crate::arrow::arrow_reader::{ArrowPredicate, BooleanSelection, RowSelection}
 use ahash::AHashMap;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use etc_array::{EtcArrayRef, EtcPrimitiveArray, EtcStringArray, EtcStringMetadata};
-use lock::{
+use lock_spec::{
     LockBefore, LockColumnMapping, LockCtx, LockDiskFile, LockEtcCompressorMetadata,
     LockEtcFsstCompressor, LockVortexCompression, LockedEntry, OrderedMutex, OrderedRwLock,
 };
@@ -21,7 +21,7 @@ use vortex_sampling_compressor::SamplingCompressor;
 /// An array that stores strings in a dictionary format, with a bit-packed array for the keys and a FSST array for the values.
 pub mod etc_array;
 mod iter;
-mod lock;
+mod lock_spec;
 mod stats;
 mod utils;
 
