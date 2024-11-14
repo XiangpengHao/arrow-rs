@@ -2,6 +2,10 @@ use crate::arrow::arrow_reader::{ArrowPredicate, BooleanSelection, RowSelection}
 use ahash::AHashMap;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use etc_array::{EtcArrayRef, EtcPrimitiveArray, EtcStringArray, EtcStringMetadata};
+use lock::{
+    LockBefore, LockColumnMapping, LockCtx, LockDiskFile, LockEtcCompressorMetadata,
+    LockEtcFsstCompressor, LockVortexCompression, LockedEntry, OrderedMutex, OrderedRwLock,
+};
 use utils::RangedFile;
 use vortex::arrow::FromArrowArray;
 use vortex::IntoCanonical;
@@ -17,6 +21,7 @@ use vortex_sampling_compressor::SamplingCompressor;
 /// An array that stores strings in a dictionary format, with a bit-packed array for the keys and a FSST array for the values.
 pub mod etc_array;
 mod iter;
+mod lock;
 mod stats;
 mod utils;
 
@@ -37,7 +42,7 @@ use std::fmt::Display;
 use std::io::Seek;
 use std::ops::{DerefMut, Range};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, LazyLock, RwLockReadGuard};
 
 static ARROW_ARRAY_CACHE: LazyLock<ArrowArrayCache> =
     LazyLock::new(|| ArrowArrayCache::initialize_from_env());
@@ -53,7 +58,7 @@ type Columns = AHashMap<usize, Rows>;
 #[derive(Debug)]
 enum CacheMode {
     InMemory,
-    OnDisk(Mutex<std::fs::File>),
+    OnDisk(OrderedMutex<LockDiskFile, std::fs::File>),
     NoCache,
     Vortex(CompressorStates),
     Etc(EtcCompressorStates),
@@ -62,15 +67,17 @@ enum CacheMode {
 #[derive(Debug)]
 struct EtcCompressorStates {
     #[allow(dead_code)]
-    metadata: RwLock<AHashMap<ArrayIdentifier, EtcStringMetadata>>,
-    fsst_compressor: RwLock<AHashMap<(usize, usize), Arc<fsst::Compressor>>>, // (row_group_id, column_id) -> compressor
+    metadata:
+        OrderedRwLock<LockEtcCompressorMetadata, AHashMap<ArrayIdentifier, EtcStringMetadata>>,
+    fsst_compressor:
+        OrderedRwLock<LockEtcFsstCompressor, AHashMap<(usize, usize), Arc<fsst::Compressor>>>, // (row_group_id, column_id) -> compressor
 }
 
 impl EtcCompressorStates {
     fn new() -> Self {
         Self {
-            metadata: RwLock::new(AHashMap::new()),
-            fsst_compressor: RwLock::new(AHashMap::new()),
+            metadata: OrderedRwLock::new(AHashMap::new()),
+            fsst_compressor: OrderedRwLock::new(AHashMap::new()),
         }
     }
 }
@@ -78,7 +85,8 @@ impl EtcCompressorStates {
 #[derive(Debug)]
 struct CompressorStates {
     compressor: SamplingCompressor<'static>,
-    compress_tree: RwLock<AHashMap<(usize, usize), CompressionTree<'static>>>,
+    compress_tree:
+        OrderedRwLock<LockVortexCompression, AHashMap<(usize, usize), CompressionTree<'static>>>,
 }
 
 impl CompressorStates {
@@ -96,17 +104,21 @@ impl CompressorStates {
         );
         Self {
             compressor,
-            compress_tree: RwLock::new(AHashMap::new()),
+            compress_tree: OrderedRwLock::new(AHashMap::new()),
         }
     }
 
-    fn compress(
+    fn compress<L>(
         &self,
         array: &vortex::Array,
         row_group_id: usize,
         column_id: usize,
-    ) -> Arc<vortex::Array> {
-        let state_lock = self.compress_tree.read().unwrap();
+        ctx: &mut LockCtx<L>,
+    ) -> Arc<vortex::Array>
+    where
+        L: LockBefore<LockVortexCompression>,
+    {
+        let (state_lock, _) = self.compress_tree.read(ctx);
 
         if let Some(tree) = state_lock.get(&(row_group_id, column_id)) {
             let compressed = self.compressor.compress(array, Some(tree)).unwrap();
@@ -117,7 +129,7 @@ impl CompressorStates {
         let compressed = self.compressor.compress(array, None).unwrap();
         let (array, tree) = compressed.into_parts();
         if let Some(tree) = tree {
-            let mut state_lock = self.compress_tree.write().unwrap();
+            let (mut state_lock, _) = self.compress_tree.write(ctx);
             state_lock.insert((row_group_id, column_id), tree);
         }
         Arc::new(array)
@@ -141,43 +153,49 @@ impl CachedEntryInner {
 }
 
 struct CachedEntry {
-    inner: RwLock<CachedEntryInner>,
+    inner: OrderedRwLock<LockedEntry, CachedEntryInner>,
 }
 
 impl CachedEntry {
-    fn row_count(&self) -> u32 {
-        self.inner.read().unwrap().row_count
+    fn row_count<L>(&self, ctx: &mut LockCtx<L>) -> u32
+    where
+        L: LockBefore<LockedEntry>,
+    {
+        self.inner.read(ctx).0.row_count
     }
 
-    fn increment_hit_count(&self) {
+    fn increment_hit_count<L>(&self, ctx: &mut LockCtx<L>)
+    where
+        L: LockBefore<LockedEntry>,
+    {
         self.inner
-            .read()
-            .unwrap()
+            .read(ctx)
+            .0
             .hit_count
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
-    fn convert_to(&self, to: CacheMode) {
-        let mut inner = self.inner.write().unwrap();
-        inner.value.convert_to(&to);
-    }
-
-    fn value(&self) -> RwLockReadGuard<'_, CachedEntryInner> {
-        self.inner.read().unwrap()
+    fn value<L>(
+        &self,
+        ctx: &mut LockCtx<L>,
+    ) -> (RwLockReadGuard<'_, CachedEntryInner>, LockCtx<LockedEntry>)
+    where
+        L: LockBefore<LockedEntry>,
+    {
+        self.inner.read(ctx)
     }
 
     fn new_in_memory(array: ArrayRef) -> Self {
         let len = array.len();
         let val = CachedValue::ArrowMemory(array);
         CachedEntry {
-            inner: RwLock::new(CachedEntryInner::new(val, len as u32)),
+            inner: OrderedRwLock::new(CachedEntryInner::new(val, len as u32)),
         }
     }
 
     fn new(value: CachedValue, row_count: usize) -> Self {
         CachedEntry {
-            inner: RwLock::new(CachedEntryInner::new(value, row_count as u32)),
+            inner: OrderedRwLock::new(CachedEntryInner::new(value, row_count as u32)),
         }
     }
 
@@ -185,7 +203,7 @@ impl CachedEntry {
         let len = array.len();
         let val = CachedValue::Vortex(array);
         CachedEntry {
-            inner: RwLock::new(CachedEntryInner::new(val, len as u32)),
+            inner: OrderedRwLock::new(CachedEntryInner::new(val, len as u32)),
         }
     }
 }
@@ -207,10 +225,10 @@ impl CachedValue {
         }
     }
 
-    fn convert_to(&mut self, to: &CacheMode) {
+    fn convert_to(&mut self, to: &CacheMode, ctx: &mut LockCtx<LockColumnMapping>) {
         match (&self, to) {
             (Self::ArrowMemory(v), CacheMode::OnDisk(file)) => {
-                let mut file = file.lock().unwrap();
+                let (mut file, _) = file.lock(ctx);
 
                 // Align start_pos to next 512 boundary for better disk I/O
                 let start_pos = file.metadata().unwrap().len();
@@ -283,7 +301,7 @@ pub enum CacheType {
 /// ArrowArrayCache is used to cache arrow arrays in memory, on disk, or in a vortex.
 pub struct ArrowArrayCache {
     /// Vec of RwLocks, where index is the row group index and value is the ColumnMapping
-    value: Vec<RwLock<Columns>>,
+    value: Vec<OrderedRwLock<LockColumnMapping, Columns>>,
     cache_mode: CacheMode,
     batch_size: usize,
 }
@@ -294,7 +312,7 @@ impl ArrowArrayCache {
             .to_lowercase()
             .as_str()
         {
-            "disk" => CacheMode::OnDisk(Mutex::new(
+            "disk" => CacheMode::OnDisk(OrderedMutex::new(
                 std::fs::File::create(ARROW_DISK_CACHE_PATH).unwrap(),
             )),
             "inmemory" => CacheMode::InMemory,
@@ -318,7 +336,7 @@ impl ArrowArrayCache {
         const MAX_ROW_GROUPS: usize = 512;
         ArrowArrayCache {
             value: (0..MAX_ROW_GROUPS)
-                .map(|_| RwLock::new(Columns::new()))
+                .map(|_| OrderedRwLock::new(Columns::new()))
                 .collect(),
             cache_mode,
             batch_size,
@@ -337,8 +355,9 @@ impl ArrowArrayCache {
 
     /// Reset the cache.
     pub fn reset(&self) {
+        let mut ctx = LockCtx::UNLOCKED;
         for row_group in self.value.iter() {
-            let mut row_group = row_group.write().unwrap();
+            let (mut row_group, _) = row_group.write(&mut ctx);
             row_group.clear();
         }
     }
@@ -350,13 +369,14 @@ impl ArrowArrayCache {
         row_group_id: usize,
         column_id: usize,
     ) -> Option<HashSet<Range<usize>>> {
-        let v = &self.value[row_group_id].read().unwrap();
+        let mut ctx = LockCtx::UNLOCKED;
+        let (v, mut ctx) = self.value[row_group_id].read(&mut ctx);
         let rows = v.get(&column_id)?;
 
         let mut result_ranges = HashSet::new();
         for (row_id, cached_entry) in rows.iter() {
             let start = *row_id;
-            let end = row_id + cached_entry.row_count() as usize;
+            let end = row_id + cached_entry.row_count(&mut ctx) as usize;
 
             result_ranges.insert(start..end);
         }
@@ -504,13 +524,14 @@ impl ArrowArrayCache {
             return None;
         }
 
-        let cache = &self.value[id.row_group_id].read().unwrap();
+        let mut ctx = LockCtx::UNLOCKED;
+        let (cache, mut ctx) = self.value[id.row_group_id].read(&mut ctx);
 
         let column_cache = cache.get(&id.column_id).unwrap();
         let cached_entry = column_cache.get(&id.row_id).unwrap();
-        cached_entry.increment_hit_count();
-        let cached_entry = cached_entry.value();
-        match &cached_entry.value {
+        cached_entry.increment_hit_count(&mut ctx);
+        let cached_entry = cached_entry.value(&mut ctx);
+        match &cached_entry.0.value {
             CachedValue::ArrowMemory(array) => {
                 let array = match selection {
                     Some(selection) => arrow_select::filter::filter(array, selection).unwrap(),
@@ -566,13 +587,15 @@ impl ArrowArrayCache {
             return None;
         }
 
-        let cache = &self.value[id.row_group_id].read().unwrap();
+        let mut ctx = LockCtx::UNLOCKED;
+
+        let (cache, mut ctx_column) = self.value[id.row_group_id].read(&mut ctx);
 
         let column_cache = cache.get(&id.column_id)?;
         let cached_entry = column_cache.get(&id.row_id)?;
-        cached_entry.increment_hit_count();
-        let cached_entry = cached_entry.value();
-        match &cached_entry.value {
+        cached_entry.increment_hit_count(&mut ctx_column);
+        let cached_entry = cached_entry.value(&mut ctx_column);
+        match &cached_entry.0.value {
             CachedValue::ArrowMemory(array) => match selection {
                 Some(selection) => Some(arrow_select::filter::filter(array, selection).unwrap()),
                 None => Some(array.clone()),
@@ -637,17 +660,21 @@ impl ArrowArrayCache {
         self.get_arrow_array_with_selection(id, None)
     }
 
-    pub(crate) fn is_cached(&self, id: &ArrayIdentifier) -> bool {
-        let cache = &self.value[id.row_group_id].read().unwrap();
+    pub(crate) fn is_cached<L>(&self, id: &ArrayIdentifier, ctx: &mut LockCtx<L>) -> bool
+    where
+        L: LockBefore<LockColumnMapping>,
+    {
+        let (cache, _) = self.value[id.row_group_id].read(ctx);
         cache.contains_key(&id.column_id)
             && cache.get(&id.column_id).unwrap().contains_key(&id.row_id)
     }
 
     pub(crate) fn get_len(&self, id: &ArrayIdentifier) -> Option<usize> {
-        let cache = &self.value[id.row_group_id].read().unwrap();
+        let mut ctx = LockCtx::UNLOCKED;
+        let (cache, mut ctx) = self.value[id.row_group_id].read(&mut ctx);
         let column_cache = cache.get(&id.column_id)?;
         let cached_entry = column_cache.get(&id.row_id)?;
-        Some(cached_entry.row_count() as usize)
+        Some(cached_entry.row_count(&mut ctx) as usize)
     }
 
     /// Insert an arrow array into the cache.
@@ -656,11 +683,12 @@ impl ArrowArrayCache {
             return;
         }
 
-        if self.is_cached(id) {
+        let mut ctx = LockCtx::UNLOCKED;
+        if self.is_cached(id, &mut ctx) {
             return;
         }
 
-        let mut cache = self.value[id.row_group_id].write().unwrap();
+        let (mut cache, mut column_ctx) = self.value[id.row_group_id].write(&mut ctx);
 
         let column_cache = cache.entry(id.column_id).or_insert_with(AHashMap::new);
 
@@ -672,7 +700,7 @@ impl ArrowArrayCache {
             CacheMode::OnDisk(_file) => {
                 let row_count = array.len();
                 let mut cached_value = CachedValue::ArrowMemory(array);
-                cached_value.convert_to(&self.cache_mode);
+                cached_value.convert_to(&self.cache_mode, &mut column_ctx);
 
                 column_cache.insert(id.row_id, CachedEntry::new(cached_value, row_count));
             }
@@ -741,9 +769,14 @@ impl ArrowArrayCache {
                     }
                 };
 
-                let compressed = compressor.compress(&uncompressed, id.row_group_id, id.column_id);
+                let compressed = compressor.compress(
+                    &uncompressed,
+                    id.row_group_id,
+                    id.column_id,
+                    &mut column_ctx,
+                );
 
-                let mut cache = self.value[id.row_group_id].write().unwrap();
+                let (mut cache, _ctx) = self.value[id.row_group_id].write(&mut ctx);
                 let column_cache = cache.entry(id.column_id).or_insert_with(AHashMap::new);
                 column_cache.insert(id.row_id, CachedEntry::new_vortex(compressed));
             }
@@ -808,7 +841,7 @@ impl ArrowArrayCache {
                 // other types
                 match array.data_type() {
                     DataType::Utf8 => {
-                        let compressor = states.fsst_compressor.read().unwrap();
+                        let (compressor, _) = states.fsst_compressor.read(&mut column_ctx);
                         if let Some(compressor) = compressor.get(&(id.row_group_id, id.column_id)) {
                             let compressed = EtcStringArray::from_string_array(
                                 array.as_string::<i32>(),
@@ -825,7 +858,7 @@ impl ArrowArrayCache {
                         }
 
                         drop(compressor);
-                        let mut compressors = states.fsst_compressor.write().unwrap();
+                        let (mut compressors, _) = states.fsst_compressor.write(&mut column_ctx);
                         let compressed =
                             EtcStringArray::from_string_array(&array.as_string::<i32>(), None);
                         let compressor = compressed.compressor();

@@ -3,7 +3,7 @@ use std::sync::{atomic::Ordering, Arc};
 use arrow_array::{DictionaryArray, RecordBatch, StringArray, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 
-use super::{ArrowArrayCache, CacheType, CachedValue};
+use super::{ArrowArrayCache, CacheType, CachedValue, LockCtx};
 
 /// ArrowCacheStatistics is used to collect statistics about the arrow array cache.
 #[derive(Debug, serde::Serialize)]
@@ -120,22 +120,23 @@ impl ArrowArrayCache {
     /// Collect statistics about the cache.
     pub fn stats(&self) -> ArrowCacheStatistics {
         let mut stats = ArrowCacheStatistics::new();
+        let mut ctx = LockCtx::UNLOCKED;
 
         for (row_group_id, row_group_lock) in self.value.iter().enumerate() {
-            let row_group = row_group_lock.read().unwrap();
+            let (row_group, mut ctx) = row_group_lock.read(&mut ctx);
 
             for (column_id, row_mapping) in row_group.iter() {
                 for (row_start_id, cached_entry) in row_mapping {
-                    let cached_entry = cached_entry.value();
-                    let cache_type = match &cached_entry.value {
+                    let cached_entry = cached_entry.value(&mut ctx);
+                    let cache_type = match &cached_entry.0.value {
                         CachedValue::ArrowMemory(_) => CacheType::InMemory,
                         CachedValue::ArrowDisk(_) => CacheType::OnDisk,
                         CachedValue::Vortex(_) => CacheType::Vortex,
                         CachedValue::Etc(_) => CacheType::Etc,
                     };
 
-                    let memory_size = cached_entry.value.memory_usage();
-                    let row_count = match &cached_entry.value {
+                    let memory_size = cached_entry.0.value.memory_usage();
+                    let row_count = match &cached_entry.0.value {
                         CachedValue::ArrowMemory(array) => array.len(),
                         CachedValue::ArrowDisk(_) => 0, // We don't know the row count for on-disk entries
                         CachedValue::Vortex(array) => array.len(),
@@ -149,7 +150,7 @@ impl ArrowArrayCache {
                         row_count as u64,
                         memory_size as u64,
                         cache_type,
-                        cached_entry.hit_count.load(Ordering::Relaxed) as u64,
+                        cached_entry.0.hit_count.load(Ordering::Relaxed) as u64,
                     );
                 }
             }
