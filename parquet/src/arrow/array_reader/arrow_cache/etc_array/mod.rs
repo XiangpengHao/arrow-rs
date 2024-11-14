@@ -3,7 +3,7 @@ mod fsst_array;
 mod primitive_array;
 mod string_array;
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, num::NonZero, sync::Arc};
 
 use arrow_array::{ArrayRef, ArrowPrimitiveType, BooleanArray};
 
@@ -83,10 +83,12 @@ pub trait EtcArray: std::fmt::Debug + Send + Sync {
 /// A reference to an ETC array.
 pub type EtcArrayRef = Arc<dyn EtcArray>;
 
-pub(crate) fn get_bit_width(max_value: u64) -> u8 {
+pub(crate) fn get_bit_width(max_value: u64) -> NonZero<u8> {
     if max_value <= 1 {
-        0
+        // todo: here we actually should return 0, as we should just use constant encoding.
+        // but that's not implemented yet.
+        NonZero::new(1).unwrap()
     } else {
-        64 - max_value.leading_zeros() as u8
+        NonZero::new(64 - max_value.leading_zeros() as u8).unwrap()
     }
 }

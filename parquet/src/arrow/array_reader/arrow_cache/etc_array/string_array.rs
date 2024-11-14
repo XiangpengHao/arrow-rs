@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::num::NonZero;
 use std::sync::Arc;
 
 use arrow_array::builder::StringDictionaryBuilder;
@@ -55,7 +56,7 @@ pub struct EtcStringMetadata {
     compressor: Arc<Compressor>,
     uncompressed_len: u32,
     keys_original_len: u32,
-    keys_bit_width: u8,
+    keys_bit_width: NonZero<u8>,
 }
 
 /// An array that stores strings in a dictionary format, with a bit-packed array for the keys and a FSST array for the values.
@@ -76,9 +77,10 @@ impl EtcStringArray {
 
         let distinct_count = values.len();
         let max_bit_width = get_bit_width(distinct_count as u64);
-        debug_assert!(2u64.pow(max_bit_width as u32) >= distinct_count as u64);
+        debug_assert!(2u64.pow(max_bit_width.get() as u32) >= distinct_count as u64);
 
-        let bit_packed_array = BitPackedArray::from_primitive(keys, max_bit_width);
+        let bit_packed_array =
+            BitPackedArray::from_primitive(keys, max_bit_width);
 
         let dict_values = values.as_string::<i32>();
 

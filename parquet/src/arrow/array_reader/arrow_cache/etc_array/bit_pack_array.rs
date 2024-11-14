@@ -1,3 +1,5 @@
+use std::num::NonZero;
+
 use arrow_array::{Array, ArrowPrimitiveType, PrimitiveArray};
 use arrow_buffer::{Buffer, ScalarBuffer};
 use arrow_data::ArrayDataBuilder;
@@ -9,7 +11,7 @@ where
     T::Native: BitPacking,
 {
     pub(crate) values: PrimitiveArray<T>,
-    pub(crate) bit_width: u8,
+    pub(crate) bit_width: NonZero<u8>,
     pub(crate) original_len: usize,
 }
 
@@ -30,7 +32,11 @@ impl<T: ArrowPrimitiveType> BitPackedArray<T>
 where
     T::Native: BitPacking,
 {
-    pub fn from_parts(values: PrimitiveArray<T>, bit_width: u8, original_len: usize) -> Self {
+    pub fn from_parts(
+        values: PrimitiveArray<T>,
+        bit_width: NonZero<u8>,
+        original_len: usize,
+    ) -> Self {
         Self {
             values,
             bit_width,
@@ -41,7 +47,7 @@ where
     pub fn new_null_array(len: usize) -> Self {
         Self {
             values: PrimitiveArray::<T>::new_null(len),
-            bit_width: 0,
+            bit_width: NonZero::new(u8::MAX).unwrap(),
             original_len: len,
         }
     }
@@ -54,15 +60,15 @@ where
         self.values.is_nullable()
     }
 
-    pub fn from_primitive(array: PrimitiveArray<T>, bit_width: u8) -> Self {
+    pub fn from_primitive(array: PrimitiveArray<T>, bit_width: NonZero<u8>) -> Self {
         let original_len = array.len();
         let (_data_type, values, nulls) = array.into_parts();
 
-        let bit_width = bit_width as usize;
+        let bit_width_usize = bit_width.get() as usize;
         let num_chunks = (original_len + 1023) / 1024;
         let num_full_chunks = original_len / 1024;
-        let packed_len =
-            (1024 * bit_width + size_of::<T::Native>() * 8 - 1) / (size_of::<T::Native>() * 8);
+        let packed_len = (1024 * bit_width_usize + size_of::<T::Native>() * 8 - 1)
+            / (size_of::<T::Native>() * 8);
 
         let mut output = Vec::<T::Native>::with_capacity(num_chunks * packed_len);
 
@@ -74,7 +80,7 @@ where
             unsafe {
                 output.set_len(output_len + packed_len);
                 BitPacking::unchecked_pack(
-                    bit_width,
+                    bit_width_usize,
                     &values[start_elem..][..1024],
                     &mut output[output_len..][..packed_len],
                 );
@@ -92,7 +98,7 @@ where
             unsafe {
                 output.set_len(output_len + packed_len);
                 BitPacking::unchecked_pack(
-                    bit_width,
+                    bit_width_usize,
                     &last_chunk,
                     &mut output[output_len..][..packed_len],
                 );
@@ -112,7 +118,7 @@ where
 
         Self {
             values,
-            bit_width: bit_width as u8,
+            bit_width,
             original_len,
         }
     }
@@ -124,7 +130,7 @@ where
                 return self.values.clone();
             }
         }
-        let bit_width = self.bit_width as usize;
+        let bit_width = self.bit_width.get() as usize;
         let packed = self.values.values().as_ref();
         let length = self.original_len;
         let offset = 0;
@@ -180,7 +186,7 @@ mod tests {
 
         let array = PrimitiveArray::<UInt32Type>::from(values);
         let before_size = array.get_array_memory_size();
-        let bit_packed = BitPackedArray::from_primitive(array, 10);
+        let bit_packed = BitPackedArray::from_primitive(array, NonZero::new(10).unwrap());
         let after_size = bit_packed.get_array_memory_size();
         println!("before: {}, after: {}", before_size, after_size);
         let unpacked = bit_packed.to_primitive();
@@ -196,7 +202,7 @@ mod tests {
         // Test with a partial chunk (500 elements)
         let values: Vec<u32> = (0..500).collect();
         let array = PrimitiveArray::<UInt32Type>::from(values);
-        let bit_packed = BitPackedArray::from_primitive(array, 10);
+        let bit_packed = BitPackedArray::from_primitive(array, NonZero::new(10).unwrap());
         let unpacked = bit_packed.to_primitive();
 
         assert_eq!(unpacked.len(), 500);
@@ -210,7 +216,7 @@ mod tests {
         // Test with multiple chunks (2048 elements = 2 full chunks)
         let values: Vec<u32> = (0..2048).collect();
         let array = PrimitiveArray::<UInt32Type>::from(values);
-        let bit_packed = BitPackedArray::from_primitive(array, 11);
+        let bit_packed = BitPackedArray::from_primitive(array, NonZero::new(11).unwrap());
         let unpacked = bit_packed.to_primitive();
 
         assert_eq!(unpacked.len(), 2048);
@@ -225,7 +231,7 @@ mod tests {
             .map(|i| if i % 2 == 0 { Some(i as u32) } else { None })
             .collect();
         let array = PrimitiveArray::<UInt32Type>::from(values);
-        let bit_packed = BitPackedArray::from_primitive(array, 10);
+        let bit_packed = BitPackedArray::from_primitive(array, NonZero::new(10).unwrap());
         let unpacked = bit_packed.to_primitive();
 
         assert_eq!(unpacked.len(), 1000);
@@ -245,7 +251,8 @@ mod tests {
         let array = PrimitiveArray::<UInt32Type>::from(values);
 
         for bit_width in [8, 16, 24, 32] {
-            let bit_packed = BitPackedArray::from_primitive(array.clone(), bit_width);
+            let bit_packed =
+                BitPackedArray::from_primitive(array.clone(), NonZero::new(bit_width).unwrap());
             let unpacked = bit_packed.to_primitive();
 
             assert_eq!(unpacked.len(), 100);

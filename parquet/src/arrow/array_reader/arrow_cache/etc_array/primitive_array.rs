@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::num::NonZero;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -45,7 +46,7 @@ impl_has_unsigned_type! {
 #[derive(Debug, Clone)]
 pub struct EtcPrimitiveMetadata {
     reference_value: u64,
-    bit_width: u8,
+    bit_width: NonZero<u8>,
     original_len: usize,
 }
 
@@ -113,6 +114,7 @@ macro_rules! impl_etc_primitive_array {
 						unsafe { std::mem::transmute(values) }
 					};
                 let schema = Schema::new(vec![Field::new("", <$ty as ArrowPrimitiveType>::DATA_TYPE, self.values.is_nullable())]);
+
 				let array = Arc::new(PrimitiveArray::<$ty>::new(values, nulls));
 				(array, schema)
             }
@@ -129,7 +131,7 @@ macro_rules! impl_etc_primitive_array {
         impl EtcPrimitiveArray<$ty> {
             /// Create an ETC primitive array from an Arrow primitive array.
             #[allow(clippy::useless_transmute, clippy::missing_transmute_annotations)]
-            pub fn from_arrow_array(arrow_array: PrimitiveArray<$ty>) -> Self {
+            pub fn from_arrow_array(arrow_array: PrimitiveArray<$ty>) -> EtcPrimitiveArray<$ty> {
 
                 let min = match arrow_arith::aggregate::min(&arrow_array){
 					Some(v) => v,
@@ -151,7 +153,7 @@ macro_rules! impl_etc_primitive_array {
 				let sub = sub as <<$ty as HasUnsignedType>::UnSignedType as ArrowPrimitiveType>::Native;
                 let bit_width = get_bit_width(sub as u64);
 
-                let (_data_type, values, nulls) = arrow_array.into_parts();
+                let (_data_type, values, nulls) = arrow_array.clone().into_parts();
                 let values = if min != 0 {
                     ScalarBuffer::from_iter(
                         values
@@ -165,7 +167,8 @@ macro_rules! impl_etc_primitive_array {
                 let unsigned_array =
                     PrimitiveArray::<<$ty as HasUnsignedType>::UnSignedType>::new(values, nulls);
 
-                let bit_packed_array = BitPackedArray::from_primitive(unsigned_array, bit_width);
+                let bit_packed_array =
+                    BitPackedArray::from_primitive(unsigned_array, bit_width);
 
                 Self {
                     values: bit_packed_array,
@@ -368,5 +371,58 @@ mod tests {
         let (result_array, _) = etc_array.to_arrow_array();
 
         assert_eq!(result_array.as_ref(), &array);
+    }
+
+    #[test]
+    fn test_filter_basic() {
+        // Create original array with some values
+        let original = vec![Some(1), Some(2), Some(3), None, Some(5)];
+        let array = PrimitiveArray::<Int32Type>::from(original);
+        let etc_array = EtcPrimitiveArray::<Int32Type>::from_arrow_array(array);
+
+        // Create selection mask: keep indices 0, 2, and 4
+        let selection = BooleanArray::from(vec![true, false, true, false, true]);
+
+        // Apply filter
+        let filtered = etc_array.filter(&selection);
+        let (result_array, _) = filtered.to_arrow_array();
+
+        // Expected result after filtering
+        let expected = PrimitiveArray::<Int32Type>::from(vec![Some(1), Some(3), Some(5)]);
+
+        assert_eq!(result_array.as_ref(), &expected);
+    }
+
+    #[test]
+    fn test_filter_all_nulls() {
+        // Create array with all nulls
+        let original = vec![None, None, None, None];
+        let array = PrimitiveArray::<Int32Type>::from(original);
+        let etc_array = EtcPrimitiveArray::<Int32Type>::from_arrow_array(array);
+
+        // Keep first and last elements
+        let selection = BooleanArray::from(vec![true, false, false, true]);
+
+        let filtered = etc_array.filter(&selection);
+        let (result_array, _) = filtered.to_arrow_array();
+
+        let expected = PrimitiveArray::<Int32Type>::from(vec![None, None]);
+
+        assert_eq!(result_array.as_ref(), &expected);
+    }
+
+    #[test]
+    fn test_filter_empty_result() {
+        let original = vec![Some(1), Some(2), Some(3)];
+        let array = PrimitiveArray::<Int32Type>::from(original);
+        let etc_array = EtcPrimitiveArray::<Int32Type>::from_arrow_array(array);
+
+        // Filter out all elements
+        let selection = BooleanArray::from(vec![false, false, false]);
+
+        let filtered = etc_array.filter(&selection);
+        let (result_array, _) = filtered.to_arrow_array();
+
+        assert_eq!(result_array.len(), 0);
     }
 }

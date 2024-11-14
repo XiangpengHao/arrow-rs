@@ -1,7 +1,7 @@
 use crate::arrow::arrow_reader::{ArrowPredicate, BooleanSelection, RowSelection};
 use ahash::AHashMap;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use etc_array::{EtcArrayRef, EtcPrimitiveArray, EtcStringArray, EtcStringMetadata};
+use etc_array::{AsEtcArray, EtcArrayRef, EtcPrimitiveArray, EtcStringArray, EtcStringMetadata};
 use lock_spec::{
     LockBefore, LockColumnMapping, LockCtx, LockDiskFile, LockEtcCompressorMetadata,
     LockEtcFsstCompressor, LockVortexCompression, LockedEntry, OrderedMutex, OrderedRwLock,
@@ -567,9 +567,21 @@ impl ArrowArrayCache {
             },
             CachedValue::Etc(array) => match selection {
                 Some(selection) => {
-                    let filtered = array.filter(selection);
-                    let result = predicate.evaluate_any(&filtered).unwrap();
-                    Some(result)
+                    if let Some(_string_array) = array.as_string_array_opt() {
+                        let filtered = array.filter(selection);
+                        let result = predicate.evaluate_any(&filtered).unwrap();
+                        Some(result)
+                    } else {
+                        let (etc_primitive, primitive_schema) = array.to_arrow_array();
+
+                        let filtered =
+                            arrow_select::filter::filter(&etc_primitive, selection).unwrap();
+                        let record_batch =
+                            RecordBatch::try_new(Arc::new(primitive_schema), vec![filtered])
+                                .unwrap();
+                        let result = predicate.evaluate(record_batch).unwrap();
+                        Some(result)
+                    }
                 }
                 None => Some(predicate.evaluate_any(array).unwrap()),
             },
