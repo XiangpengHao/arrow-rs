@@ -56,6 +56,7 @@ where
         self.original_len
     }
 
+    #[allow(dead_code)]
     pub fn is_nullable(&self) -> bool {
         self.values.is_nullable()
     }
@@ -171,6 +172,17 @@ where
 
     pub(crate) fn get_array_memory_size(&self) -> usize {
         self.values.get_array_memory_size()
+    }
+}
+
+#[allow(dead_code)]
+fn best_arrow_primitive_width(bit_width: NonZero<u8>) -> usize {
+    match bit_width.get() {
+        0..=8 => 8,
+        9..=16 => 16,
+        17..=32 => 32,
+        33..=64 => 64,
+        _ => panic!("Unsupported bit width: {}", bit_width.get()),
     }
 }
 

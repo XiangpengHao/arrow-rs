@@ -572,13 +572,18 @@ impl ArrowArrayCache {
                         let result = predicate.evaluate_any(&filtered).unwrap();
                         Some(result)
                     } else {
-                        let (etc_primitive, primitive_schema) = array.to_arrow_array();
+                        let etc_primitive = array.to_arrow_array();
 
                         let filtered =
                             arrow_select::filter::filter(&etc_primitive, selection).unwrap();
+
+                        let schema = Schema::new(vec![Field::new(
+                            "",
+                            etc_primitive.data_type().clone(),
+                            etc_primitive.is_nullable(),
+                        )]);
                         let record_batch =
-                            RecordBatch::try_new(Arc::new(primitive_schema), vec![filtered])
-                                .unwrap();
+                            RecordBatch::try_new(Arc::new(schema), vec![filtered]).unwrap();
                         let result = predicate.evaluate(record_batch).unwrap();
                         Some(result)
                     }
@@ -654,13 +659,24 @@ impl ArrowArrayCache {
             },
             CachedValue::Etc(array) => match selection {
                 Some(selection) => {
-                    let array = array.filter(selection);
-                    let (arrow_array, _) = array.to_arrow_array();
-                    Some(arrow_array)
+                    if let Some(string_array) = array.as_string_array_opt() {
+                        let arrow_array = string_array.to_dict_string_with_selection(selection);
+                        Some(Arc::new(arrow_array))
+                    } else {
+                        let etc_primitive = array.to_arrow_array();
+                        let filtered =
+                            arrow_select::filter::filter(&etc_primitive, selection).unwrap();
+                        Some(filtered)
+                    }
                 }
                 None => {
-                    let (arrow_array, _) = array.to_arrow_array();
-                    Some(arrow_array)
+                    if let Some(string_array) = array.as_string_array_opt() {
+                        let arrow_array = string_array.to_dict_string();
+                        Some(Arc::new(arrow_array))
+                    } else {
+                        let arrow_array = array.to_arrow_array();
+                        Some(arrow_array)
+                    }
                 }
             },
         }
@@ -878,6 +894,24 @@ impl ArrowArrayCache {
                             id.row_id,
                             CachedEntry::new(CachedValue::Etc(Arc::new(compressed)), array.len()),
                         );
+                    }
+                    DataType::Dictionary(_, _) => {
+                        if let Some(dict_array) = array.as_dictionary_opt::<ArrowUInt16Type>() {
+                            let values = dict_array.values();
+                            if let Some(_string_array) = values.as_string_opt::<i32>() {
+                                let etc_array = EtcStringArray::from_dict_array(&dict_array);
+                                column_cache.insert(
+                                    id.row_id,
+                                    CachedEntry::new(
+                                        CachedValue::Etc(Arc::new(etc_array)),
+                                        array.len(),
+                                    ),
+                                );
+                                return;
+                            }
+                        }
+
+                        panic!("unsupported data type {:?}", array.data_type());
                     }
                     _ => panic!("unsupported data type {:?}", array.data_type()),
                 }

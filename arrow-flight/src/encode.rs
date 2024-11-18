@@ -138,7 +138,7 @@ impl Default for FlightDataEncoderBuilder {
             app_metadata: Bytes::new(),
             schema: None,
             descriptor: None,
-            dictionary_handling: DictionaryHandling::Hydrate,
+            dictionary_handling: DictionaryHandling::Resend,
         }
     }
 }

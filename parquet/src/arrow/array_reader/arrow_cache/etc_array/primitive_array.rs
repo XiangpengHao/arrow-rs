@@ -100,7 +100,7 @@ macro_rules! impl_etc_primitive_array {
 
             #[inline]
             #[allow(clippy::useless_transmute, clippy::missing_transmute_annotations)]
-            fn to_arrow_array(&self) -> (ArrayRef, Schema) {
+            fn to_arrow_array(&self) -> ArrayRef {
                 let unsigned_array = self.values.to_primitive();
 				let (_data_type, values, nulls) = unsigned_array.into_parts();
 				let values =
@@ -113,14 +113,13 @@ macro_rules! impl_etc_primitive_array {
 					} else {
 						unsafe { std::mem::transmute(values) }
 					};
-                let schema = Schema::new(vec![Field::new("", <$ty as ArrowPrimitiveType>::DATA_TYPE, self.values.is_nullable())]);
 
 				let array = Arc::new(PrimitiveArray::<$ty>::new(values, nulls));
-				(array, schema)
+				array
             }
 
             fn filter(&self, selection: &BooleanArray) -> EtcArrayRef {
-                let (values, _) = self.to_arrow_array();
+                let values = self.to_arrow_array();
                 let filtered_values = arrow_select::filter::filter(&values, selection).unwrap();
                 let primitive_values = filtered_values.as_primitive::<$ty>().clone();
                 let bit_packed = Self::from_arrow_array(primitive_values);
@@ -233,7 +232,7 @@ mod tests {
 
                 // Convert to ETC array and back
                 let etc_array = EtcPrimitiveArray::<$type>::from_arrow_array(array.clone());
-                let (result_array, _) = etc_array.to_arrow_array();
+                let result_array = etc_array.to_arrow_array();
 
                 assert_eq!(result_array.as_ref(), &array);
             }
@@ -346,7 +345,7 @@ mod tests {
         let original: Vec<Option<i32>> = vec![None, None, None];
         let array = PrimitiveArray::<Int32Type>::from(original.clone());
         let etc_array = EtcPrimitiveArray::<Int32Type>::from_arrow_array(array);
-        let (result_array, _) = etc_array.to_arrow_array();
+        let result_array = etc_array.to_arrow_array();
 
         assert_eq!(result_array.len(), original.len());
         assert_eq!(result_array.null_count(), original.len());
@@ -357,7 +356,7 @@ mod tests {
         let original: Vec<Option<i32>> = vec![Some(0), Some(1), Some(2), None, Some(4)];
         let array = PrimitiveArray::<Int32Type>::from(original.clone());
         let etc_array = EtcPrimitiveArray::<Int32Type>::from_arrow_array(array.clone());
-        let (result_array, _) = etc_array.to_arrow_array();
+        let result_array = etc_array.to_arrow_array();
 
         assert_eq!(etc_array.reference_value, 0);
         assert_eq!(result_array.as_ref(), &array);
@@ -368,7 +367,7 @@ mod tests {
         let original: Vec<Option<i32>> = vec![Some(42)];
         let array = PrimitiveArray::<Int32Type>::from(original.clone());
         let etc_array = EtcPrimitiveArray::<Int32Type>::from_arrow_array(array.clone());
-        let (result_array, _) = etc_array.to_arrow_array();
+        let result_array = etc_array.to_arrow_array();
 
         assert_eq!(result_array.as_ref(), &array);
     }
@@ -385,7 +384,7 @@ mod tests {
 
         // Apply filter
         let filtered = etc_array.filter(&selection);
-        let (result_array, _) = filtered.to_arrow_array();
+        let result_array = filtered.to_arrow_array();
 
         // Expected result after filtering
         let expected = PrimitiveArray::<Int32Type>::from(vec![Some(1), Some(3), Some(5)]);
@@ -404,7 +403,7 @@ mod tests {
         let selection = BooleanArray::from(vec![true, false, false, true]);
 
         let filtered = etc_array.filter(&selection);
-        let (result_array, _) = filtered.to_arrow_array();
+        let result_array = filtered.to_arrow_array();
 
         let expected = PrimitiveArray::<Int32Type>::from(vec![None, None]);
 
@@ -421,7 +420,7 @@ mod tests {
         let selection = BooleanArray::from(vec![false, false, false]);
 
         let filtered = etc_array.filter(&selection);
-        let (result_array, _) = filtered.to_arrow_array();
+        let result_array = filtered.to_arrow_array();
 
         assert_eq!(result_array.len(), 0);
     }

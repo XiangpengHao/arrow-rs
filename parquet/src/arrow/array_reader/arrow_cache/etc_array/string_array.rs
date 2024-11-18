@@ -3,7 +3,7 @@ use std::num::NonZero;
 use std::sync::Arc;
 
 use arrow_array::builder::StringDictionaryBuilder;
-use arrow_array::{cast::AsArray, types::UInt32Type, DictionaryArray, StringArray};
+use arrow_array::{cast::AsArray, types::UInt16Type, DictionaryArray, StringArray};
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, PrimitiveArray, RecordBatch};
 
 use arrow_buffer::BooleanBuffer;
@@ -28,10 +28,9 @@ impl EtcArray for EtcStringArray {
     }
 
     #[inline]
-    fn to_arrow_array(&self) -> (ArrayRef, Schema) {
+    fn to_arrow_array(&self) -> ArrayRef {
         let dict = self.to_string_array();
-        let schema = Schema::new(vec![Field::new("", DataType::Utf8, false)]);
-        (Arc::new(dict), schema)
+        Arc::new(dict)
     }
 
     fn filter(&self, selection: &BooleanArray) -> EtcArrayRef {
@@ -40,7 +39,7 @@ impl EtcArray for EtcStringArray {
         let primitive_keys = keys.to_primitive();
         let filtered_keys = arrow_select::filter::filter(&primitive_keys, selection)
             .unwrap()
-            .as_primitive::<UInt32Type>()
+            .as_primitive::<UInt16Type>()
             .clone();
         let bit_packed_array = BitPackedArray::from_primitive(filtered_keys, keys.bit_width);
         Arc::new(EtcStringArray {
@@ -62,7 +61,7 @@ pub struct EtcStringMetadata {
 /// An array that stores strings in a dictionary format, with a bit-packed array for the keys and a FSST array for the values.
 #[derive(Debug)]
 pub struct EtcStringArray {
-    keys: BitPackedArray<UInt32Type>,
+    keys: BitPackedArray<UInt16Type>,
     values: FsstArray,
 }
 
@@ -73,14 +72,13 @@ impl EtcStringArray {
         let (keys, values) = dict.into_parts();
 
         let (_, keys, nulls) = keys.into_parts();
-        let keys = PrimitiveArray::<UInt32Type>::try_new(keys, nulls).unwrap();
+        let keys = PrimitiveArray::<UInt16Type>::try_new(keys, nulls).unwrap();
 
         let distinct_count = values.len();
         let max_bit_width = get_bit_width(distinct_count as u64);
         debug_assert!(2u64.pow(max_bit_width.get() as u32) >= distinct_count as u64);
 
-        let bit_packed_array =
-            BitPackedArray::from_primitive(keys, max_bit_width);
+        let bit_packed_array = BitPackedArray::from_primitive(keys, max_bit_width);
 
         let dict_values = values.as_string::<i32>();
 
@@ -96,16 +94,57 @@ impl EtcStringArray {
         }
     }
 
+    /// Directly create an EtcStringArray from a DictionaryArray.
+    pub fn from_dict_array(array: &DictionaryArray<UInt16Type>) -> Self {
+        let dict = array.downcast_dict::<StringArray>().unwrap();
+        let mut deduplicated = StringDictionaryBuilder::<UInt16Type>::new();
+        for v in dict.into_iter() {
+            deduplicated.append_option(v);
+        }
+
+        let dict = deduplicated.finish();
+        let keys = dict.keys();
+
+        assert_eq!(dict.len(), array.len());
+        let values = dict.values().as_string::<i32>();
+
+        let value_count = values.len();
+        let max_bit_width = get_bit_width(value_count as u64);
+        debug_assert!(2u64.pow(max_bit_width.get() as u32) >= value_count as u64);
+
+        let bit_packed_array = BitPackedArray::from_primitive(keys.clone(), max_bit_width);
+
+        let fsst_values = FsstArray::from(values);
+        EtcStringArray {
+            keys: bit_packed_array,
+            values: fsst_values,
+        }
+    }
+
     /// Get the compressor of the EtcStringArray.
     pub fn compressor(&self) -> Arc<Compressor> {
         self.values.compressor.clone()
     }
 
     /// Convert the EtcStringArray to a DictionaryArray.
-    pub fn to_dict_string(&self) -> DictionaryArray<UInt32Type> {
+    pub fn to_dict_string(&self) -> DictionaryArray<UInt16Type> {
         let primitive_key = self.keys.to_primitive().clone();
         let values: StringArray = StringArray::from(&self.values);
-        unsafe { DictionaryArray::<UInt32Type>::new_unchecked(primitive_key, Arc::new(values)) }
+        unsafe { DictionaryArray::<UInt16Type>::new_unchecked(primitive_key, Arc::new(values)) }
+    }
+
+    /// Convert the EtcStringArray to a DictionaryArray with a selection.
+    pub fn to_dict_string_with_selection(
+        &self,
+        selection: &BooleanArray,
+    ) -> DictionaryArray<UInt16Type> {
+        let primitive_key = self.keys.to_primitive().clone();
+        let filtered_keys = arrow_select::filter::filter(&primitive_key, selection)
+            .unwrap()
+            .as_primitive::<UInt16Type>()
+            .clone();
+        let values: StringArray = StringArray::from(&self.values);
+        unsafe { DictionaryArray::<UInt16Type>::new_unchecked(filtered_keys, Arc::new(values)) }
     }
 
     /// Convert the EtcStringArray to a StringArray.
@@ -134,7 +173,7 @@ impl EtcStringArray {
 
     /// Reconstruct the EtcStringArray from a RecordBatch.
     pub fn from_record_batch(batch: RecordBatch, metadata: &EtcStringMetadata) -> Self {
-        let key_column = batch.column(0).as_primitive::<UInt32Type>();
+        let key_column = batch.column(0).as_primitive::<UInt16Type>();
         let values_column = batch.column(1).as_binary();
 
         let keys = BitPackedArray::from_parts(
@@ -187,7 +226,7 @@ impl EtcStringArray {
         let mut return_mask = BooleanBuffer::new_unset(keys.len());
         for idx in values.set_indices() {
             let result =
-                arrow_ord::cmp::eq(&keys, &PrimitiveArray::<UInt32Type>::new_scalar(idx as u32))
+                arrow_ord::cmp::eq(&keys, &PrimitiveArray::<UInt16Type>::new_scalar(idx as u16))
                     .unwrap();
             let (values, _nulls) = result.into_parts();
             return_mask = &return_mask | &values;
@@ -196,8 +235,8 @@ impl EtcStringArray {
     }
 }
 
-fn string_to_dict_string(input: &StringArray) -> DictionaryArray<UInt32Type> {
-    let mut builder = StringDictionaryBuilder::<UInt32Type>::new();
+fn string_to_dict_string(input: &StringArray) -> DictionaryArray<UInt16Type> {
+    let mut builder = StringDictionaryBuilder::<UInt16Type>::new();
     for s in input.iter() {
         builder.append_option(s);
     }

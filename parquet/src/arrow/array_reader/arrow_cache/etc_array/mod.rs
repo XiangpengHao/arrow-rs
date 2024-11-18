@@ -7,7 +7,6 @@ use std::{any::Any, num::NonZero, sync::Arc};
 
 use arrow_array::{ArrayRef, ArrowPrimitiveType, BooleanArray};
 
-use arrow_schema::Schema;
 use bit_pack_array::BitPackedArray;
 use fastlanes::BitPacking;
 use fsst_array::FsstArray;
@@ -74,7 +73,12 @@ pub trait EtcArray: std::fmt::Debug + Send + Sync {
     }
 
     /// Convert the ETC array to an Arrow array.
-    fn to_arrow_array(&self) -> (ArrayRef, Schema);
+    fn to_arrow_array(&self) -> ArrayRef;
+
+    /// Convert the ETC array to an Arrow array.
+    fn to_best_arrow_array(&self) -> ArrayRef {
+        self.to_arrow_array()
+    }
 
     /// Filter the ETC array with a boolean array.
     fn filter(&self, selection: &BooleanArray) -> EtcArrayRef;

@@ -349,15 +349,22 @@ impl<'a> Iterator for BooleanSelectionIter<'a> {
                 make_dummy_record_batch(&self.schema, selection.true_count())
             } else {
                 let mut columns = Vec::with_capacity(self.schema.fields().len());
-                for &column_id in &self.parquet_column_ids {
+                let mut fields = vec![];
+                for (i, &column_id) in self.parquet_column_ids.iter().enumerate() {
                     let id = ArrayIdentifier::new(self.row_group_id, column_id, self.cur_row_id);
                     let array = self
                         .cache
                         .get_arrow_array_with_selection(&id, Some(&selection))
                         .unwrap();
+                    fields.push(Field::new(
+                        self.schema.field(i).name(),
+                        array.data_type().clone(),
+                        array.is_nullable(),
+                    ));
                     columns.push(array);
                 }
-                RecordBatch::try_new(self.schema.clone(), columns).unwrap()
+                let schema = Arc::new(Schema::new(fields));
+                RecordBatch::try_new(schema, columns).unwrap()
             };
 
             self.cur_row_id += want_to_select;

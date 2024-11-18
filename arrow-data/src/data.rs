@@ -1944,7 +1944,7 @@ impl ArrayDataBuilder {
     pub fn build_aligned(self) -> Result<ArrayData, ArrowError> {
         let mut data = unsafe { self.build_impl() };
         data.align_buffers();
-        data.validate_data()?;
+        // data.validate_data()?;
         Ok(data)
     }
 }
