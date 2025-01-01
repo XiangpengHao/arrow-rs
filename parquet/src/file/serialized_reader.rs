@@ -371,7 +371,7 @@ fn read_page_header_len<T: Read>(input: &mut T) -> Result<(usize, PageHeader)> {
 /// Decodes a [`Page`] from the provided `buffer`
 pub(crate) fn decode_page(
     page_header: PageHeader,
-    buffer: Vec<u8>,
+    buffer: Bytes,
     physical_type: Type,
     decompressor: Option<&mut Box<dyn Codec>>,
 ) -> Result<Page> {
@@ -422,11 +422,10 @@ pub(crate) fn decode_page(
                 ));
             }
 
-            decompressed
+            Bytes::from(decompressed)
         }
         _ => buffer,
     };
-    let buffer = Bytes::from(buffer);
 
     let result = match page_header.type_ {
         PageType::DICTIONARY_PAGE => {
@@ -673,7 +672,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
 
                     decode_page(
                         header,
-                        buffer,
+                        Bytes::from(buffer),
                         self.physical_type,
                         self.decompressor.as_mut(),
                     )?
@@ -702,7 +701,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                     let bytes = buffer.slice(offset..);
                     decode_page(
                         header,
-                        bytes.to_vec(),
+                        bytes,
                         self.physical_type,
                         self.decompressor.as_mut(),
                     )?
