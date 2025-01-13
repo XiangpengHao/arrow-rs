@@ -1,6 +1,7 @@
 use arrow_array::builder::{BinaryBuilder, StringBuilder};
 use arrow_array::{Array, BinaryArray, GenericByteArray, StringArray};
 use fsst::Compressor;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -97,7 +98,17 @@ impl From<&FsstArray> for StringArray {
         for v in value.compressed.iter() {
             match v {
                 Some(v) => {
-                    decompressor.decompress_into(v, decompress_buffer.spare_capacity_mut());
+                    let cap = decompressor.max_decompression_capacity(v);
+                    let decompressed = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            decompress_buffer.as_mut_ptr() as *mut MaybeUninit<u8>,
+                            cap,
+                        )
+                    };
+                    let len = decompressor.decompress_into(v, decompressed);
+                    unsafe {
+                        decompress_buffer.set_len(len);
+                    }
                     let s = unsafe { std::str::from_utf8_unchecked(&decompress_buffer) };
                     builder.append_value(s);
                 }
