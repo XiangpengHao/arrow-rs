@@ -4,19 +4,9 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use etc_array::{AsEtcArray, EtcArrayRef, EtcPrimitiveArray, EtcStringArray, EtcStringMetadata};
 use lock_spec::{
     LockBefore, LockColumnMapping, LockCtx, LockDiskFile, LockEtcCompressorMetadata,
-    LockEtcFsstCompressor, LockVortexCompression, LockedEntry, OrderedMutex, OrderedRwLock,
+    LockEtcFsstCompressor, LockedEntry, OrderedMutex, OrderedRwLock,
 };
 use utils::RangedFile;
-use vortex::arrow::FromArrowArray;
-use vortex::IntoCanonical;
-use vortex_sampling_compressor::compressors::alp::ALPCompressor;
-use vortex_sampling_compressor::compressors::bitpacked::BITPACK_WITH_PATCHES;
-use vortex_sampling_compressor::compressors::delta::DeltaCompressor;
-use vortex_sampling_compressor::compressors::dict::DictCompressor;
-use vortex_sampling_compressor::compressors::fsst::FSSTCompressor;
-use vortex_sampling_compressor::compressors::r#for::FoRCompressor;
-use vortex_sampling_compressor::compressors::{CompressionTree, CompressorRef};
-use vortex_sampling_compressor::SamplingCompressor;
 
 /// An array that stores strings in a dictionary format, with a bit-packed array for the keys and a FSST array for the values.
 pub mod etc_array;
@@ -29,10 +19,9 @@ pub use stats::ArrowCacheStatistics;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Date32Type as ArrowDate32Type, Date64Type as ArrowDate64Type, Int16Type as ArrowInt16Type,
-    Int32Type as ArrowInt32Type, Int64Type as ArrowInt64Type, Int8Type as ArrowInt8Type,
-    UInt16Type as ArrowUInt16Type, UInt32Type as ArrowUInt32Type, UInt64Type as ArrowUInt64Type,
-    UInt8Type as ArrowUInt8Type,
+    Int16Type as ArrowInt16Type, Int32Type as ArrowInt32Type, Int64Type as ArrowInt64Type,
+    Int8Type as ArrowInt8Type, UInt16Type as ArrowUInt16Type, UInt32Type as ArrowUInt32Type,
+    UInt64Type as ArrowUInt64Type, UInt8Type as ArrowUInt8Type,
 };
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch, RecordBatchWriter};
 use arrow_ipc::reader::FileReader;
@@ -60,11 +49,9 @@ enum CacheMode {
     InMemory,
     OnDisk(OrderedMutex<LockDiskFile, std::fs::File>),
     NoCache,
-    Vortex(CompressorStates),
     Etc(EtcCompressorStates),
 }
 
-#[derive(Debug)]
 struct EtcCompressorStates {
     #[allow(dead_code)]
     metadata:
@@ -73,66 +60,18 @@ struct EtcCompressorStates {
         OrderedRwLock<LockEtcFsstCompressor, AHashMap<(usize, usize), Arc<fsst::Compressor>>>, // (row_group_id, column_id) -> compressor
 }
 
+impl std::fmt::Debug for EtcCompressorStates {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EtcCompressorStates")
+    }
+}
+
 impl EtcCompressorStates {
     fn new() -> Self {
         Self {
             metadata: OrderedRwLock::new(AHashMap::new()),
             fsst_compressor: OrderedRwLock::new(AHashMap::new()),
         }
-    }
-}
-
-#[derive(Debug)]
-struct CompressorStates {
-    compressor: SamplingCompressor<'static>,
-    compress_tree:
-        OrderedRwLock<LockVortexCompression, AHashMap<(usize, usize), CompressionTree<'static>>>,
-}
-
-impl CompressorStates {
-    fn new() -> Self {
-        let compressor = SamplingCompressor::new_with_options(
-            HashSet::from([
-                &ALPCompressor as CompressorRef,
-                &BITPACK_WITH_PATCHES,
-                &DeltaCompressor,
-                &FSSTCompressor,
-                &DictCompressor,
-                &FoRCompressor,
-            ]),
-            Default::default(),
-        );
-        Self {
-            compressor,
-            compress_tree: OrderedRwLock::new(AHashMap::new()),
-        }
-    }
-
-    fn compress<L>(
-        &self,
-        array: &vortex::Array,
-        row_group_id: usize,
-        column_id: usize,
-        ctx: &mut LockCtx<L>,
-    ) -> Arc<vortex::Array>
-    where
-        L: LockBefore<LockVortexCompression>,
-    {
-        let (state_lock, _) = self.compress_tree.read(ctx);
-
-        if let Some(tree) = state_lock.get(&(row_group_id, column_id)) {
-            let compressed = self.compressor.compress(array, Some(tree)).unwrap();
-            return Arc::new(compressed.into_array());
-        }
-        drop(state_lock);
-
-        let compressed = self.compressor.compress(array, None).unwrap();
-        let (array, tree) = compressed.into_parts();
-        if let Some(tree) = tree {
-            let (mut state_lock, _) = self.compress_tree.write(ctx);
-            state_lock.insert((row_group_id, column_id), tree);
-        }
-        Arc::new(array)
     }
 }
 
@@ -198,19 +137,10 @@ impl CachedEntry {
             inner: OrderedRwLock::new(CachedEntryInner::new(value, row_count as u32)),
         }
     }
-
-    fn new_vortex(array: Arc<vortex::Array>) -> Self {
-        let len = array.len();
-        let val = CachedValue::Vortex(array);
-        CachedEntry {
-            inner: OrderedRwLock::new(CachedEntryInner::new(val, len as u32)),
-        }
-    }
 }
 
 enum CachedValue {
     ArrowMemory(ArrayRef),
-    Vortex(Arc<vortex::Array>),
     ArrowDisk(Range<u64>),
     Etc(EtcArrayRef),
 }
@@ -220,7 +150,6 @@ impl CachedValue {
         match self {
             Self::ArrowMemory(array) => array.get_array_memory_size(),
             Self::ArrowDisk(_) => 0,
-            Self::Vortex(array) => array.nbytes(),
             Self::Etc(array) => array.get_array_memory_size(),
         }
     }
@@ -259,7 +188,6 @@ impl Display for CachedValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ArrowMemory(_) => write!(f, "ArrowMemory"),
-            Self::Vortex(_) => write!(f, "Vortex"),
             Self::ArrowDisk(_) => write!(f, "ArrowDisk"),
             Self::Etc(_) => write!(f, "Etc"),
         }
@@ -317,7 +245,6 @@ impl ArrowArrayCache {
             )),
             "inmemory" => CacheMode::InMemory,
             "nocache" => CacheMode::NoCache,
-            "vortex" => CacheMode::Vortex(CompressorStates::new()),
             "etc" => CacheMode::Etc(EtcCompressorStates::new()),
             _ => panic!(
                 "Invalid cache mode: {}, must be one of [disk, inmemory, nocache, vortex, etc]",
@@ -556,15 +483,6 @@ impl ArrowArrayCache {
                 let array = predicate.evaluate(batch).unwrap();
                 Some(array)
             }
-            CachedValue::Vortex(array) => match selection {
-                Some(selection) => {
-                    let selection = vortex::Array::from_arrow(selection, false);
-                    let filtered = vortex::compute::filter(array, &selection).unwrap();
-                    let array = predicate.evaluate_any(&filtered).unwrap();
-                    Some(array)
-                }
-                None => Some(predicate.evaluate_any(array).unwrap()),
-            },
             CachedValue::Etc(array) => match selection {
                 Some(selection) => {
                     if let Some(_string_array) = array.as_string_array_opt() {
@@ -631,32 +549,6 @@ impl ArrowArrayCache {
                     None => Some(array.clone()),
                 }
             }
-            CachedValue::Vortex(array) => match selection {
-                Some(selection) => {
-                    let predicate = vortex::Array::from_arrow(selection, false);
-                    let filtered = vortex::compute::filter(array, &predicate).unwrap();
-                    let array = filtered.into_canonical().unwrap();
-                    let canonical_array = array.into_arrow().unwrap();
-
-                    // let canonical_array = (**array)
-                    //     .clone()
-                    //     .into_canonical()
-                    //     .unwrap()
-                    //     .into_arrow()
-                    //     .unwrap();
-                    // let canonical_array =
-                    //     arrow_select::filter::filter(&canonical_array, selection).unwrap();
-                    Some(canonical_array)
-                }
-                None => Some(
-                    (**array)
-                        .clone()
-                        .into_canonical()
-                        .unwrap()
-                        .into_arrow()
-                        .unwrap(),
-                ),
-            },
             CachedValue::Etc(array) => match selection {
                 Some(selection) => {
                     if let Some(string_array) = array.as_string_array_opt() {
@@ -730,82 +622,6 @@ impl ArrowArrayCache {
                 cached_value.convert_to(&self.cache_mode, &mut column_ctx);
 
                 column_cache.insert(id.row_id, CachedEntry::new(cached_value, row_count));
-            }
-            CacheMode::Vortex(compressor) => {
-                let data_type = array.data_type();
-
-                if array.len() < self.batch_size {
-                    // our batch is too small.
-                    column_cache.insert(id.row_id, CachedEntry::new_in_memory(array));
-                    return;
-                }
-
-                drop(cache); // blocking call below, release the lock
-
-                let uncompressed = match data_type {
-                    DataType::Date32 => {
-                        let primitive_array = array.as_primitive::<ArrowDate32Type>();
-                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
-                    }
-                    DataType::Date64 => {
-                        let primitive_array = array.as_primitive::<ArrowDate64Type>();
-                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
-                    }
-                    DataType::UInt64 => {
-                        let primitive_array = array.as_primitive::<ArrowUInt64Type>();
-                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
-                    }
-                    DataType::UInt32 => {
-                        let primitive_array = array.as_primitive::<ArrowUInt32Type>();
-                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
-                    }
-                    DataType::UInt16 => {
-                        let primitive_array = array.as_primitive::<ArrowUInt16Type>();
-                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
-                    }
-                    DataType::UInt8 => {
-                        let primitive_array = array.as_primitive::<ArrowUInt8Type>();
-                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
-                    }
-                    DataType::Int64 => {
-                        let primitive_array = array.as_primitive::<ArrowInt64Type>();
-                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
-                    }
-                    DataType::Int32 => {
-                        let primitive_array = array.as_primitive::<ArrowInt32Type>();
-                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
-                    }
-                    DataType::Int16 => {
-                        let primitive_array = array.as_primitive::<ArrowInt16Type>();
-                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
-                    }
-                    DataType::Int8 => {
-                        let primitive_array = array.as_primitive::<ArrowInt8Type>();
-                        vortex::Array::from_arrow(primitive_array, array.logical_nulls().is_some())
-                    }
-                    DataType::Utf8 => {
-                        let string_array = array.as_string::<i32>();
-                        vortex::Array::from_arrow(string_array, array.logical_nulls().is_some())
-                    }
-                    DataType::Utf8View => {
-                        let string_array = array.as_string_view();
-                        vortex::Array::from_arrow(string_array, array.logical_nulls().is_some())
-                    }
-                    _ => {
-                        unimplemented!("data type {:?} not implemented", data_type);
-                    }
-                };
-
-                let compressed = compressor.compress(
-                    &uncompressed,
-                    id.row_group_id,
-                    id.column_id,
-                    &mut column_ctx,
-                );
-
-                let (mut cache, _ctx) = self.value[id.row_group_id].write(&mut ctx);
-                let column_cache = cache.entry(id.column_id).or_insert_with(AHashMap::new);
-                column_cache.insert(id.row_id, CachedEntry::new_vortex(compressed));
             }
 
             CacheMode::NoCache => {

@@ -50,12 +50,17 @@ impl EtcArray for EtcStringArray {
 }
 
 /// Metadata for the EtcStringArray.
-#[derive(Debug)]
 pub struct EtcStringMetadata {
     compressor: Arc<Compressor>,
     uncompressed_len: u32,
     keys_original_len: u32,
     keys_bit_width: NonZero<u8>,
+}
+
+impl std::fmt::Debug for EtcStringMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EtcStringMetadata")
+    }
 }
 
 /// An array that stores strings in a dictionary format, with a bit-packed array for the keys and a FSST array for the values.

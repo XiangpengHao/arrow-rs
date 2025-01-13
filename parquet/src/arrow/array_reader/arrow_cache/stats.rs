@@ -132,7 +132,6 @@ impl ArrowArrayCache {
                     let cache_type = match &cached_entry.0.value {
                         CachedValue::ArrowMemory(_) => CacheType::InMemory,
                         CachedValue::ArrowDisk(_) => CacheType::OnDisk,
-                        CachedValue::Vortex(_) => CacheType::Vortex,
                         CachedValue::Etc(_) => CacheType::Etc,
                     };
 
@@ -140,7 +139,6 @@ impl ArrowArrayCache {
                     let row_count = match &cached_entry.0.value {
                         CachedValue::ArrowMemory(array) => array.len(),
                         CachedValue::ArrowDisk(_) => 0, // We don't know the row count for on-disk entries
-                        CachedValue::Vortex(array) => array.len(),
                         CachedValue::Etc(array) => array.len(),
                     };
 
