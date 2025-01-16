@@ -36,7 +36,7 @@ mod complex;
 mod primitive;
 
 use crate::arrow::ProjectionMask;
-pub(crate) use complex::{ParquetField, ParquetFieldType};
+pub use complex::{ParquetField, ParquetFieldType};
 
 use super::PARQUET_FIELD_ID_META_KEY;
 
@@ -62,7 +62,7 @@ pub fn parquet_to_arrow_schema_by_columns(
 }
 
 /// Extracts the arrow metadata
-pub(crate) fn parquet_to_arrow_schema_and_fields(
+pub fn parquet_to_arrow_schema_and_fields(
     parquet_schema: &SchemaDescriptor,
     mask: ProjectionMask,
     key_value_metadata: Option<&Vec<KeyValue>>,
