@@ -28,7 +28,7 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use crate::writer::DictionaryTracker;
-use crate::{size_prefixed_root_as_message, KeyValue, Message, CONTINUATION_MARKER};
+use crate::{size_prefixed_root_as_message_unchecked, KeyValue, Message, CONTINUATION_MARKER};
 use DataType::*;
 
 /// Low level Arrow [Schema] to IPC bytes converter
@@ -269,9 +269,7 @@ pub fn try_schema_from_ipc_buffer(buffer: &[u8]) -> Result<Schema, ArrowError> {
             // buffer
             0
         };
-        let msg = size_prefixed_root_as_message(&buffer[begin_offset..]).map_err(|err| {
-            ArrowError::ParseError(format!("Unable to convert flight info to a message: {err}"))
-        })?;
+        let msg = unsafe { size_prefixed_root_as_message_unchecked(&buffer[begin_offset..]) };
         let ipc_schema = msg.header_as_schema().ok_or_else(|| {
             ArrowError::ParseError("Unable to convert flight info to a schema".to_string())
         })?;

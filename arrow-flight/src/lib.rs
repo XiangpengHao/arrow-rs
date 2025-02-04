@@ -867,6 +867,20 @@ mod tests {
     }
 
     #[test]
+    fn test_dict_schema() {
+        let schema = Schema::new(vec![
+            Field::new_dictionary("a", DataType::UInt16, DataType::Utf8, false),
+            Field::new_dictionary("b", DataType::UInt16, DataType::Utf8, false),
+        ]);
+
+        let flight_info = FlightInfo::new().try_with_schema(&schema).unwrap();
+
+        let new_schema = Schema::try_from(flight_info).unwrap();
+        // println!("new_schema: {:?}", new_schema);
+        assert_eq!(schema, new_schema);
+    }
+
+    #[test]
     fn ser_deser_schema_result() {
         let schema = Schema::new(vec![
             Field::new("c1", DataType::Utf8, false),
