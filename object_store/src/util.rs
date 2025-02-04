@@ -197,6 +197,9 @@ pub enum GetRange {
     /// an error will be returned. Additionally, if the range ends after the end
     /// of the object, the entire remainder of the object will be returned.
     /// Otherwise, the exact requested range will be returned.
+    ///
+    /// Note that range is u64 (i.e., not usize),
+    /// as `object_store` supports 32-bit architectures such as WASM
     Bounded(Range<u64>),
     /// Request all bytes starting from a given byte offset
     Offset(u64),
@@ -211,19 +214,27 @@ pub(crate) enum InvalidGetRange {
 
     #[error("Range started at {start} and ended at {end}")]
     Inconsistent { start: u64, end: u64 },
+
+    #[error("Range {requested} is larger than system memory limit {max}")]
+    TooLarge { requested: u64, max: u64 },
 }
 
 impl GetRange {
     pub(crate) fn is_valid(&self) -> Result<(), InvalidGetRange> {
-        match self {
-            Self::Bounded(r) if r.end <= r.start => {
+        if let Self::Bounded(r) = self {
+            if r.end <= r.start {
                 return Err(InvalidGetRange::Inconsistent {
                     start: r.start,
                     end: r.end,
                 });
             }
-            _ => (),
-        };
+            if (r.end - r.start) > usize::MAX as u64 {
+                return Err(InvalidGetRange::TooLarge {
+                    requested: r.start,
+                    max: usize::MAX as u64,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -318,13 +329,13 @@ mod tests {
     use crate::Error;
 
     use super::*;
-    use rand::{thread_rng, Rng};
+    use rand::{rng, Rng};
     use std::ops::Range;
 
     /// Calls coalesce_ranges and validates the returned data is correct
     ///
     /// Returns the fetched ranges
-    async fn do_fetch(ranges: Vec<Range<usize>>, coalesce: usize) -> Vec<Range<usize>> {
+    async fn do_fetch(ranges: Vec<Range<u64>>, coalesce: u64) -> Vec<Range<u64>> {
         let max = ranges.iter().map(|x| x.end).max().unwrap_or(0);
         let src: Vec<_> = (0..max).map(|x| x as u8).collect();
 
@@ -333,7 +344,9 @@ mod tests {
             &ranges,
             |range| {
                 fetches.push(range.clone());
-                futures::future::ready(Ok(Bytes::from(src[range].to_vec())))
+                let start = usize::try_from(range.start).unwrap();
+                let end = usize::try_from(range.end).unwrap();
+                futures::future::ready(Ok(Bytes::from(src[start..end].to_vec())))
             },
             coalesce,
         )
@@ -342,7 +355,10 @@ mod tests {
 
         assert_eq!(ranges.len(), coalesced.len());
         for (range, bytes) in ranges.iter().zip(coalesced) {
-            assert_eq!(bytes.as_ref(), &src[range.clone()]);
+            assert_eq!(
+                bytes.as_ref(),
+                &src[usize::try_from(range.start).unwrap()..usize::try_from(range.end).unwrap()]
+            );
         }
         fetches
     }
@@ -379,20 +395,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_coalesce_fuzz() {
-        let mut rand = thread_rng();
+        let mut rand = rng();
         for _ in 0..100 {
-            let object_len = rand.gen_range(10..250);
-            let range_count = rand.gen_range(0..10);
+            let object_len = rand.random_range(10..250);
+            let range_count = rand.random_range(0..10);
             let ranges: Vec<_> = (0..range_count)
                 .map(|_| {
-                    let start = rand.gen_range(0..object_len);
+                    let start = rand.random_range(0..object_len);
                     let max_len = 20.min(object_len - start);
-                    let len = rand.gen_range(0..max_len);
+                    let len = rand.random_range(0..max_len);
                     start..start + len
                 })
                 .collect();
 
-            let coalesce = rand.gen_range(1..5);
+            let coalesce = rand.random_range(1..5);
             let fetches = do_fetch(ranges.clone(), coalesce).await;
 
             for fetch in fetches.windows(2) {

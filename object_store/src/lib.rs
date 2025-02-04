@@ -234,7 +234,7 @@
 //!
 //! // Buffer the entire object in memory
 //! let object: Bytes = result.bytes().await.unwrap();
-//! assert_eq!(object.len(), meta.size);
+//! assert_eq!(object.len() as u64, meta.size);
 //!
 //! // Alternatively stream the bytes from object storage
 //! let stream = object_store.get(&path).await.unwrap().into_stream();
@@ -903,7 +903,9 @@ pub struct ObjectMeta {
     pub location: Path,
     /// The last modified time
     pub last_modified: DateTime<Utc>,
-    /// The size in bytes of the object
+    /// The size in bytes of the object.
+    ///
+    /// Note this is not `usize` as `object_store` supports 32-bit architectures such as WASM
     pub size: u64,
     /// The unique identifier for the object
     ///
@@ -1019,6 +1021,8 @@ pub struct GetResult {
     /// The [`ObjectMeta`] for this object
     pub meta: ObjectMeta,
     /// The range of bytes returned by this request
+    ///
+    /// Note this is not `usize` as `object_store` supports 32-bit architectures such as WASM
     pub range: Range<u64>,
     /// Additional object attributes
     pub attributes: Attributes,
@@ -1060,7 +1064,11 @@ impl GetResult {
                             path: path.clone(),
                         })?;
 
-                    let mut buffer = Vec::with_capacity(len);
+                    let mut buffer = if let Ok(len) = len.try_into() {
+                        Vec::with_capacity(len)
+                    } else {
+                        Vec::new()
+                    };
                     file.take(len as _)
                         .read_to_end(&mut buffer)
                         .map_err(|source| local::Error::UnableToReadBytes { source, path })?;
