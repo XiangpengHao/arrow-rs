@@ -308,7 +308,12 @@ fn create_primitive_array(
         t => unreachable!("Data type {:?} either unsupported or not primitive", t),
     };
 
-    let array_data = builder.align_buffers(!require_alignment).build()?;
+    let array_data = unsafe {
+        builder
+            .align_buffers(!require_alignment)
+            .skip_validation(true)
+            .build()
+    }?;
 
     Ok(make_array(array_data))
 }
@@ -340,7 +345,12 @@ fn create_list_array(
         _ => unreachable!("Cannot create list or map array from {:?}", data_type),
     };
 
-    let array_data = builder.align_buffers(!require_alignment).build()?;
+    let array_data = unsafe {
+        builder
+            .align_buffers(!require_alignment)
+            .skip_validation(true)
+            .build()
+    }?;
 
     Ok(make_array(array_data))
 }
@@ -356,13 +366,16 @@ fn create_dictionary_array(
 ) -> Result<ArrayRef, ArrowError> {
     if let Dictionary(_, _) = *data_type {
         let null_buffer = (field_node.null_count() > 0).then_some(buffers[0].clone());
-        let array_data = ArrayData::builder(data_type.clone())
-            .len(field_node.length() as usize)
-            .add_buffer(buffers[1].clone())
-            .add_child_data(value_array.into_data())
-            .null_bit_buffer(null_buffer)
-            .align_buffers(!require_alignment)
-            .build()?;
+        let array_data = unsafe {
+            ArrayData::builder(data_type.clone())
+                .len(field_node.length() as usize)
+                .add_buffer(buffers[1].clone())
+                .add_child_data(value_array.into_data())
+                .null_bit_buffer(null_buffer)
+                .align_buffers(!require_alignment)
+                .skip_validation(true)
+                .build()?
+        };
 
         Ok(make_array(array_data))
     } else {
