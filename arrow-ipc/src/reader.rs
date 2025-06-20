@@ -490,13 +490,25 @@ impl<'a> RecordBatchDecoder<'a> {
                     self.skip_field(field, &mut variadic_counts)?;
                 }
             }
-            assert!(variadic_counts.is_empty());
+
             arrays.sort_by_key(|t| t.0);
-            RecordBatch::try_new_with_options(
-                Arc::new(schema.project(projection)?),
-                arrays.into_iter().map(|t| t.1).collect(),
-                &options,
-            )
+
+            let schema = Arc::new(schema.project(projection)?);
+            let columns = arrays.into_iter().map(|t| t.1).collect::<Vec<_>>();
+
+            if self.skip_validation.get() {
+                // Safety: setting `skip_validation` requires `unsafe`, user assures data is valid
+                unsafe {
+                    Ok(RecordBatch::new_unchecked(
+                        schema,
+                        columns,
+                        self.batch.length() as usize,
+                    ))
+                }
+            } else {
+                assert!(variadic_counts.is_empty());
+                RecordBatch::try_new_with_options(schema, columns, &options)
+            }
         } else {
             let mut children = vec![];
             // keep track of index as lists require more than one node
@@ -504,8 +516,20 @@ impl<'a> RecordBatchDecoder<'a> {
                 let child = self.create_array(field, &mut variadic_counts)?;
                 children.push(child);
             }
-            assert!(variadic_counts.is_empty());
-            RecordBatch::try_new_with_options(schema, children, &options)
+
+            if self.skip_validation.get() {
+                // Safety: setting `skip_validation` requires `unsafe`, user assures data is valid
+                unsafe {
+                    Ok(RecordBatch::new_unchecked(
+                        schema,
+                        children,
+                        self.batch.length() as usize,
+                    ))
+                }
+            } else {
+                assert!(variadic_counts.is_empty());
+                RecordBatch::try_new_with_options(schema, children, &options)
+            }
         }
     }
 
@@ -1571,12 +1595,14 @@ impl<R: Read> RecordBatchReader for StreamReader<R> {
 
 #[cfg(test)]
 mod tests {
-    use crate::writer::{unslice_run_array, DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
+    use crate::convert::fb_to_schema;
+    use crate::writer::{
+        unslice_run_array, write_message, DictionaryTracker, IpcDataGenerator, IpcWriteOptions,
+    };
 
     use super::*;
 
-    use crate::convert::fb_to_schema;
-    use crate::{root_as_footer, root_as_message};
+    use crate::{root_as_footer, root_as_message, size_prefixed_root_as_message};
     use arrow_array::builder::{PrimitiveRunBuilder, UnionBuilder};
     use arrow_array::types::*;
     use arrow_buffer::{NullBuffer, OffsetBuffer};
@@ -2546,12 +2572,7 @@ mod tests {
     fn test_invalid_struct_array_ipc_read_errors() {
         let a_field = Field::new("a", DataType::Int32, false);
         let b_field = Field::new("b", DataType::Int32, false);
-
-        let schema = Arc::new(Schema::new(vec![Field::new_struct(
-            "s",
-            vec![a_field.clone(), b_field.clone()],
-            false,
-        )]));
+        let struct_fields = Fields::from(vec![a_field.clone(), b_field.clone()]);
 
         let a_array_data = ArrayData::builder(a_field.data_type().clone())
             .len(4)
@@ -2564,17 +2585,14 @@ mod tests {
             .build()
             .unwrap();
 
-        let struct_data_type = schema.field(0).data_type();
-
         let invalid_struct_arr = unsafe {
-            make_array(
-                ArrayData::builder(struct_data_type.clone())
-                    .len(4)
-                    .add_child_data(a_array_data)
-                    .add_child_data(b_array_data)
-                    .build_unchecked(),
+            StructArray::new_unchecked(
+                struct_fields,
+                vec![make_array(a_array_data), make_array(b_array_data)],
+                None,
             )
         };
+
         expect_ipc_validation_error(
             Arc::new(invalid_struct_arr),
             "Invalid argument error: Incorrect array length for StructArray field \"b\", expected 4 got 3",
@@ -2818,5 +2836,44 @@ mod tests {
         read_ipc_with_decoder_skip_validation(buf.clone()).unwrap();
         let err = read_ipc_with_decoder(buf).unwrap_err();
         assert_eq!(err.to_string(), expected_err);
+    }
+
+    #[test]
+    fn test_roundtrip_schema() {
+        let schema = Schema::new(vec![
+            Field::new(
+                "a",
+                DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
+                false,
+            ),
+            Field::new(
+                "b",
+                DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]);
+
+        let options = IpcWriteOptions::default();
+        let data_gen = IpcDataGenerator::default();
+        let mut dict_tracker = DictionaryTracker::new(false);
+        let encoded_data =
+            data_gen.schema_to_bytes_with_dictionary_tracker(&schema, &mut dict_tracker, &options);
+        let mut schema_bytes = vec![];
+        write_message(&mut schema_bytes, encoded_data, &options).expect("write_message");
+
+        let begin_offset: usize = if schema_bytes[0..4].eq(&CONTINUATION_MARKER) {
+            4
+        } else {
+            0
+        };
+
+        size_prefixed_root_as_message(&schema_bytes[begin_offset..])
+            .expect_err("size_prefixed_root_as_message");
+
+        let msg = parse_message(&schema_bytes).expect("parse_message");
+        let ipc_schema = msg.header_as_schema().expect("header_as_schema");
+        let new_schema = fb_to_schema(ipc_schema);
+
+        assert_eq!(schema, new_schema);
     }
 }
