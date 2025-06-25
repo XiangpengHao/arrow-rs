@@ -240,5 +240,10 @@ name = "row_selector"
 harness = false
 required-features = ["arrow"]
 
+[[bench]]
+name = "rle_decoder"
+required-features = ["experimental"]
+harness = false
+
 [lib]
 bench = false
