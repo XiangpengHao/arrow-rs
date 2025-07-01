@@ -28,7 +28,7 @@ use std::fmt::Formatter;
 use std::io::SeekFrom;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes};
@@ -40,7 +40,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Fields, Schema, SchemaRef};
 
-use crate::arrow::array_reader::{build_array_reader, RowGroups};
+use crate::arrow::array_reader::row_group_cache::RowGroupCache;
+use crate::arrow::array_reader::{build_cached_array_reader, RowGroups};
 use crate::arrow::arrow_reader::{
     apply_range, evaluate_predicate, selects_any, ArrowReaderBuilder, ArrowReaderMetadata,
     ArrowReaderOptions, ParquetRecordBatchReader, RowFilter, RowSelection,
@@ -562,6 +563,8 @@ where
             .filter(|index| !index.is_empty())
             .map(|x| x[row_group_idx].as_slice());
 
+        let row_group_cache = Arc::new(Mutex::new(RowGroupCache::new(batch_size)));
+
         let mut row_group = InMemoryRowGroup {
             metadata: meta,
             // schema: meta.schema_descr_ptr(),
@@ -581,8 +584,16 @@ where
                     .fetch(&mut self.input, predicate_projection, selection.as_ref())
                     .await?;
 
-                let array_reader =
-                    build_array_reader(self.fields.as_deref(), predicate_projection, &row_group)?;
+                let mut cache_projection = predicate_projection.clone();
+                cache_projection.intersect(&projection);
+
+                let array_reader = build_cached_array_reader(
+                    self.fields.as_deref(),
+                    predicate_projection,
+                    &row_group,
+                    row_group_cache.clone(),
+                    &cache_projection,
+                )?;
 
                 selection = Some(evaluate_predicate(
                     batch_size,
@@ -630,13 +641,31 @@ where
             .fetch(&mut self.input, &projection, selection.as_ref())
             .await?;
 
-        let reader = ParquetRecordBatchReader::new(
-            batch_size,
-            build_array_reader(self.fields.as_deref(), &projection, &row_group)?,
-            selection,
-        );
+        let cache_projection = match self.compute_cache_projection(&projection) {
+            Some(projection) => projection,
+            None => ProjectionMask::none(meta.columns().len()),
+        };
+        let array_reader = build_cached_array_reader(
+            self.fields.as_deref(),
+            &projection,
+            &row_group,
+            row_group_cache.clone(),
+            &cache_projection,
+        )?;
+
+        let reader = ParquetRecordBatchReader::new(batch_size, array_reader, selection);
 
         Ok((self, Some(reader)))
+    }
+
+    fn compute_cache_projection(&self, projection: &ProjectionMask) -> Option<ProjectionMask> {
+        let filters = self.filter.as_ref()?;
+        let mut cache_projection = filters.predicates.first()?.projection().clone();
+        for predicate in filters.predicates.iter() {
+            cache_projection.union(&predicate.projection());
+        }
+        cache_projection.intersect(projection);
+        Some(cache_projection)
     }
 }
 

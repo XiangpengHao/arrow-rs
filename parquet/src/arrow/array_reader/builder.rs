@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow_schema::{DataType, Fields, SchemaBuilder};
 
@@ -24,8 +24,8 @@ use crate::arrow::array_reader::empty_array::make_empty_array_reader;
 use crate::arrow::array_reader::fixed_len_byte_array::make_fixed_len_byte_array_reader;
 use crate::arrow::array_reader::{
     make_byte_array_dictionary_reader, make_byte_array_reader, ArrayReader,
-    FixedSizeListArrayReader, ListArrayReader, MapArrayReader, NullArrayReader,
-    PrimitiveArrayReader, RowGroups, StructArrayReader,
+    CachedArrayReader, FixedSizeListArrayReader, ListArrayReader, MapArrayReader, NullArrayReader,
+    PrimitiveArrayReader, RowGroups, StructArrayReader, row_group_cache::RowGroupCache,
 };
 use crate::arrow::schema::{ParquetField, ParquetFieldType};
 use crate::arrow::ProjectionMask;
@@ -313,6 +313,239 @@ fn build_struct_reader(
 
     for (arrow, parquet) in arrow_fields.iter().zip(children) {
         if let Some(reader) = build_reader(parquet, mask, row_groups)? {
+            // Need to retrieve underlying data type to handle projection
+            let child_type = reader.get_data_type().clone();
+            builder.push(arrow.as_ref().clone().with_data_type(child_type));
+            readers.push(reader);
+        }
+    }
+
+    if readers.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(Box::new(StructArrayReader::new(
+        DataType::Struct(builder.finish().fields),
+        readers,
+        field.def_level,
+        field.rep_level,
+        field.nullable,
+    ))))
+}
+
+/// Create a cached array reader from parquet schema, projection mask, and parquet file reader.
+/// This recursively applies caching to all primitive (leaf) readers in the tree.
+/// Only columns that appear in both predicate projection AND cache projection will use caching.
+pub fn build_cached_array_reader(
+    field: Option<&ParquetField>,
+    mask: &ProjectionMask,
+    row_groups: &dyn RowGroups,
+    cache: Arc<Mutex<RowGroupCache>>,
+    cache_projection: &ProjectionMask,
+) -> Result<Box<dyn ArrayReader>> {
+    let reader = field
+        .and_then(|field| build_cached_reader(field, mask, row_groups, cache.clone(), cache_projection).transpose())
+        .transpose()?
+        .unwrap_or_else(|| make_empty_array_reader(row_groups.num_rows()));
+
+    Ok(reader)
+}
+
+fn build_cached_reader(
+    field: &ParquetField,
+    mask: &ProjectionMask,
+    row_groups: &dyn RowGroups,
+    cache: Arc<Mutex<RowGroupCache>>,
+    cache_projection: &ProjectionMask,
+) -> Result<Option<Box<dyn ArrayReader>>> {
+    match field.field_type {
+        ParquetFieldType::Primitive { col_idx, .. } => {
+            // For primitive readers, only wrap with cache if column is in both projections
+            if let Some(inner_reader) = build_primitive_reader(field, mask, row_groups)? {
+                if cache_projection.leaf_included(col_idx) {
+                    Ok(Some(Box::new(CachedArrayReader::new(
+                        inner_reader,
+                        cache,
+                        col_idx,
+                    ))))
+                } else {
+                    Ok(Some(inner_reader))
+                }
+            } else {
+                Ok(None)
+            }
+        }
+        ParquetFieldType::Group { .. } => match &field.arrow_type {
+            DataType::Map(_, _) => build_cached_map_reader(field, mask, row_groups, cache, cache_projection),
+            DataType::Struct(_) => build_cached_struct_reader(field, mask, row_groups, cache, cache_projection),
+            DataType::List(_) => build_cached_list_reader(field, mask, false, row_groups, cache, cache_projection),
+            DataType::LargeList(_) => build_cached_list_reader(field, mask, true, row_groups, cache, cache_projection),
+            DataType::FixedSizeList(_, _) => build_cached_fixed_size_list_reader(field, mask, row_groups, cache, cache_projection),
+            d => unimplemented!("reading group type {} not implemented", d),
+        },
+    }
+}
+
+/// Build cached array reader for map type.
+fn build_cached_map_reader(
+    field: &ParquetField,
+    mask: &ProjectionMask,
+    row_groups: &dyn RowGroups,
+    cache: Arc<Mutex<RowGroupCache>>,
+    cache_projection: &ProjectionMask,
+) -> Result<Option<Box<dyn ArrayReader>>> {
+    let children = field.children().unwrap();
+    assert_eq!(children.len(), 2);
+
+    let key_reader = build_cached_reader(&children[0], mask, row_groups, cache.clone(), cache_projection)?;
+    let value_reader = build_cached_reader(&children[1], mask, row_groups, cache, cache_projection)?;
+
+    match (key_reader, value_reader) {
+        (Some(key_reader), Some(value_reader)) => {
+            // Need to retrieve underlying data type to handle projection
+            let key_type = key_reader.get_data_type().clone();
+            let value_type = value_reader.get_data_type().clone();
+
+            let data_type = match &field.arrow_type {
+                DataType::Map(map_field, is_sorted) => match map_field.data_type() {
+                    DataType::Struct(fields) => {
+                        assert_eq!(fields.len(), 2);
+                        let struct_field = map_field.as_ref().clone().with_data_type(
+                            DataType::Struct(Fields::from(vec![
+                                fields[0].as_ref().clone().with_data_type(key_type),
+                                fields[1].as_ref().clone().with_data_type(value_type),
+                            ])),
+                        );
+                        DataType::Map(Arc::new(struct_field), *is_sorted)
+                    }
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            };
+
+            Ok(Some(Box::new(MapArrayReader::new(
+                key_reader,
+                value_reader,
+                data_type,
+                field.def_level,
+                field.rep_level,
+                field.nullable,
+            ))))
+        }
+        (None, None) => Ok(None),
+        _ => Err(general_err!(
+            "partial projection of MapArray is not supported"
+        )),
+    }
+}
+
+/// Build cached array reader for list type.
+fn build_cached_list_reader(
+    field: &ParquetField,
+    mask: &ProjectionMask,
+    is_large: bool,
+    row_groups: &dyn RowGroups,
+    cache: Arc<Mutex<RowGroupCache>>,
+    cache_projection: &ProjectionMask,
+) -> Result<Option<Box<dyn ArrayReader>>> {
+    let children = field.children().unwrap();
+    assert_eq!(children.len(), 1);
+
+    let reader = match build_cached_reader(&children[0], mask, row_groups, cache, cache_projection)? {
+        Some(item_reader) => {
+            // Need to retrieve underlying data type to handle projection
+            let item_type = item_reader.get_data_type().clone();
+            let data_type = match &field.arrow_type {
+                DataType::List(f) => {
+                    DataType::List(Arc::new(f.as_ref().clone().with_data_type(item_type)))
+                }
+                DataType::LargeList(f) => {
+                    DataType::LargeList(Arc::new(f.as_ref().clone().with_data_type(item_type)))
+                }
+                _ => unreachable!(),
+            };
+
+            let reader = match is_large {
+                false => Box::new(ListArrayReader::<i32>::new(
+                    item_reader,
+                    data_type,
+                    field.def_level,
+                    field.rep_level,
+                    field.nullable,
+                )) as _,
+                true => Box::new(ListArrayReader::<i64>::new(
+                    item_reader,
+                    data_type,
+                    field.def_level,
+                    field.rep_level,
+                    field.nullable,
+                )) as _,
+            };
+            Some(reader)
+        }
+        None => None,
+    };
+    Ok(reader)
+}
+
+/// Build cached array reader for fixed-size list type.
+fn build_cached_fixed_size_list_reader(
+    field: &ParquetField,
+    mask: &ProjectionMask,
+    row_groups: &dyn RowGroups,
+    cache: Arc<Mutex<RowGroupCache>>,
+    cache_projection: &ProjectionMask,
+) -> Result<Option<Box<dyn ArrayReader>>> {
+    let children = field.children().unwrap();
+    assert_eq!(children.len(), 1);
+
+    let reader = match build_cached_reader(&children[0], mask, row_groups, cache, cache_projection)? {
+        Some(item_reader) => {
+            let item_type = item_reader.get_data_type().clone();
+            let reader = match &field.arrow_type {
+                &DataType::FixedSizeList(ref f, size) => {
+                    let data_type = DataType::FixedSizeList(
+                        Arc::new(f.as_ref().clone().with_data_type(item_type)),
+                        size,
+                    );
+
+                    Box::new(FixedSizeListArrayReader::new(
+                        item_reader,
+                        size as usize,
+                        data_type,
+                        field.def_level,
+                        field.rep_level,
+                        field.nullable,
+                    )) as _
+                }
+                _ => unimplemented!(),
+            };
+            Some(reader)
+        }
+        None => None,
+    };
+    Ok(reader)
+}
+
+fn build_cached_struct_reader(
+    field: &ParquetField,
+    mask: &ProjectionMask,
+    row_groups: &dyn RowGroups,
+    cache: Arc<Mutex<RowGroupCache>>,
+    cache_projection: &ProjectionMask,
+) -> Result<Option<Box<dyn ArrayReader>>> {
+    let arrow_fields = match &field.arrow_type {
+        DataType::Struct(children) => children,
+        _ => unreachable!(),
+    };
+    let children = field.children().unwrap();
+    assert_eq!(arrow_fields.len(), children.len());
+
+    let mut readers = Vec::with_capacity(children.len());
+    let mut builder = SchemaBuilder::with_capacity(children.len());
+
+    for (arrow, parquet) in arrow_fields.iter().zip(children) {
+        if let Some(reader) = build_cached_reader(parquet, mask, row_groups, cache.clone(), cache_projection)? {
             // Need to retrieve underlying data type to handle projection
             let child_type = reader.get_data_type().clone();
             builder.push(arrow.as_ref().clone().with_data_type(child_type));
